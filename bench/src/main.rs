@@ -323,14 +323,23 @@ fn evaluate(path: &str, how_many: usize, seed: u64) {
     let contains = Contains::new(&entries);
     let relevance = Relevance::new(&entries);
     let entry_words: Vec<Vec<String>> = entries.iter().map(|v| words(v)).collect();
+    // `ENDINGS=none`: only the same letters count in the filter (to compare).
+    let base = Options {
+        endings: if std::env::var("ENDINGS").is_ok_and(|v| v == "none") {
+            &probable::Endings::NONE
+        } else {
+            &probable::Endings::ITALIAN
+        },
+        ..Options::default()
+    };
     let unfiltered = Options {
         exclude_below: None,
-        ..Options::default()
+        ..base.clone()
     };
     let strict = Options {
         exclude_below: None,
         require_all_words: true,
-        ..Options::default()
+        ..base.clone()
     };
     let levels = [
         ("no typos", 0.0),
@@ -370,11 +379,7 @@ fn evaluate(path: &str, how_many: usize, seed: u64) {
                 .map(|h| h.index)
                 .collect();
             if done == 1 {
-                let from_library: Vec<usize> = index
-                    .search(&q.text, &Options::default())
-                    .iter()
-                    .map(|h| h.index)
-                    .collect();
+                let from_library: Vec<usize> = index.search(&q.text, &base).iter().map(|h| h.index).collect();
                 assert_eq!(from_library, filtered);
             }
             let all: Vec<usize> = hits.iter().map(|h| h.index).collect();

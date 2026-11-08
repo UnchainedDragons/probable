@@ -423,6 +423,7 @@ fn pieces_by_definition(index: &Index, i: usize, word: &Word<'_>) -> Vec<Piece> 
             if typed > 0.0 {
                 add(Piece {
                     at: s as u32,
+                    len: (e - s) as u32,
                     key: fnv(&text[s..e]),
                     ln_chosen: chosen + spaces,
                     ln_typed: typed.ln(),
@@ -448,6 +449,7 @@ fn pieces_by_definition(index: &Index, i: usize, word: &Word<'_>) -> Vec<Piece> 
         if inside <= k {
             add(Piece {
                 at: s as u32,
+                len: (end - s) as u32,
                 key: fnv(&text[s..end]),
                 ln_chosen: chosen,
                 ln_typed: word.channel.inside(end - s, inside).ln(),
@@ -690,5 +692,86 @@ fn the_words_of_a_query_come_from_the_same_entry() {
         let mut f = indexes_with(&index, q, &all);
         f.sort_unstable();
         assert_eq!(f, [0, 1], "{q}");
+    }
+}
+
+#[test]
+fn another_form_of_the_word_counts_with_the_endings() {
+    let mut entries: Vec<String> = (0..40)
+        .map(|k| format!("valvola a sfera in ottone {k}"))
+        .collect();
+    entries.push("VALVOLE A SFERA 3/4".to_string());
+    entries.push("valva di conchiglia".to_string());
+    let index = Index::new(&entries);
+    let plain = Options {
+        require_all_words: true,
+        endings: &Endings::NONE,
+        ..Options::default()
+    };
+    let italian = Options {
+        endings: &Endings::ITALIAN,
+        ..plain.clone()
+    };
+    // Without the endings «valvole» is a typo of «valvola», which is exact elsewhere: left out.
+    assert!(!indexes_with(&index, "valvola sfera", &plain).contains(&40));
+    // With them it is the same word, and comes after the entries with the form typed.
+    let found = indexes_with(&index, "valvola sfera", &italian);
+    assert!(found.contains(&40), "{found:?}");
+    assert_eq!(found.last(), Some(&40));
+    assert!(!found.contains(&41), "«valva» has no «sfera»");
+    // The order never changes, only what the filter keeps.
+    let all = |o: &Options| {
+        index
+            .search(
+                "valvola sfera",
+                &Options {
+                    exclude_below: None,
+                    ..o.clone()
+                },
+            )
+            .into_iter()
+            .map(|h| h.index)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(all(&plain), all(&italian));
+}
+
+/// With the endings the probability of an entry can only grow: the filter never leaves out an
+/// entry it kept without them, and the scores are the same.
+#[test]
+fn the_endings_never_leave_out_more() {
+    let mut random = Random(99);
+    for round in 0..300 {
+        let entries: Vec<String> = (0..random.n(40))
+            .map(|_| {
+                let l = random.n(if round % 50 == 0 { 200 } else { 25 });
+                random.text(l) + [" tubo", " tubi", " rosso", " rossa", ""][random.n(5)]
+            })
+            .collect();
+        let index = Index::new(&entries);
+        for _ in 0..8 {
+            let l = random.n(8);
+            let query = random.text(l) + [" tubo", " rossi", ""][random.n(3)];
+            for require_all_words in [false, true] {
+                let plain = Options {
+                    require_all_words,
+                    exclude_below: None,
+                    endings: &Endings::NONE,
+                    ..Options::default()
+                };
+                let italian = Options {
+                    endings: &Endings::ITALIAN,
+                    ..plain.clone()
+                };
+                let a = index.search(&query, &plain);
+                let b = index.search(&query, &italian);
+                for h in &a {
+                    let g = b.iter().find(|g| g.index == h.index).expect("still there");
+                    assert!(g.probability >= h.probability - 1e-12, "{query:?} {h:?} {g:?}");
+                    assert!((g.score - h.score).abs() < 1e-12);
+                }
+                assert!(b.iter().all(|g| (0.0..=1.0).contains(&g.probability)));
+            }
+        }
     }
 }

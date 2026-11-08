@@ -11,6 +11,9 @@
 //!   than if it is any entry, which orders the results; and the **probability** that the entry
 //!   has what each typed word stands for, which the filter compares with a threshold ε (1% by
 //!   default). Both are estimated on the list itself.
+//! - The filter asks whether the entry has the word typed in any of its forms ("tubi" for
+//!   "tubo"), with the probability that two forms are the same word ([`Endings`]); the order
+//!   stays that of the model.
 //!
 //! ```
 //! use probable::{Index, Options};
@@ -22,6 +25,7 @@
 //!
 //! The model and the reasons behind it are in the README.
 
+mod endings;
 mod fold;
 mod model;
 mod myers;
@@ -34,6 +38,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use fold::UNKNOWN;
 use model::{Channel, Depth, FOREIGN_LISTED, MAX_ERRORS, SPACE, new_string};
 use myers::Pattern;
+
+pub use endings::Endings;
 
 /// How to search.
 #[derive(Clone, Debug)]
@@ -60,6 +66,10 @@ pub struct Options {
     /// does not find "ACM-18". For lists where numbers identify things (codes, sizes,
     /// measures); typos stay allowed in the letters.
     pub exact_numbers: bool,
+    /// The endings of the language of the list: an entry has the word typed also in another form
+    /// ("tubi" for "tubo"), with the probability that the two are the same word. Only the filter
+    /// uses it, never the order. [`Endings::NONE`]: the same letters are needed.
+    pub endings: &'static Endings,
 }
 
 impl Default for Options {
@@ -72,6 +82,7 @@ impl Default for Options {
             typo_rate: 0.03,
             missing_word: 0.01,
             exact_numbers: false,
+            endings: &Endings::ITALIAN,
         }
     }
 }
@@ -216,8 +227,9 @@ const PARALLEL_MIN: usize = 1 << 18;
 /// typed together, from the word starting at `at`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Piece {
-    /// Where it starts in its entry.
+    /// Where it starts in its entry, and how many letters it has.
     at: u32,
+    len: u32,
     /// The hash of its letters.
     key: u64,
     /// `ln P(this piece is the one chosen | the entry)`: depth, field, spaces left out.
@@ -263,6 +275,9 @@ struct Worth {
     keys: Vec<(u64, f64)>,
     /// Some entry has the word exactly, whole or begun, from a word start.
     exact: bool,
+    /// For each piece found, the other forms of the same word that the word also found, with the
+    /// probability that they are the same word ([`Options::endings`]).
+    forms: ByKey<Vec<(u64, f64)>>,
 }
 
 /// An entry where a word found something.
@@ -327,12 +342,18 @@ const MOST_CHOICES: usize = 256;
 /// pieces there, or "not in the entry" when that counts as having it.
 #[derive(Default)]
 struct Tuples {
-    options: Vec<Vec<(u64, f64)>>,
+    /// For each unit: (key, weight, factor). The weight orders the choices when there are too
+    /// many; the factor is what the choice contributes to the product.
+    options: Vec<Vec<(u64, f64, f64)>>,
     at: Vec<usize>,
 }
 
 impl Tuples {
-    /// Calls `visit(hash of reading r and the choice, prior × Π worth)` for every choice.
+    /// Calls `visit(hash of reading r and the choice, prior × Π factors)` for every choice. The
+    /// factor of a piece is its worth; with `forms`, each piece of the entry counts once as itself
+    /// (factor 1) and once as each other form of the same word found by the unit (factor P(same
+    /// word)), and "not in the entry" has factor 1: what the entry has, not what it is worth.
+    #[allow(clippy::too_many_arguments)]
     fn each(
         &mut self,
         r: usize,
@@ -340,6 +361,7 @@ impl Tuples {
         units: &[usize],
         mine: &[Option<u32>],
         worth: &[&Worth],
+        forms: bool,
         mut visit: impl FnMut(u64, f64),
     ) {
         self.options.resize_with(units.len(), Vec::new);
@@ -348,11 +370,25 @@ impl Tuples {
             let w = worth[u];
             if let Some(c) = mine[u] {
                 let (a, b) = w.found[c as usize].keys;
-                o.extend_from_slice(&w.keys[a as usize..b as usize]);
+                for &(key, weight) in &w.keys[a as usize..b as usize] {
+                    if forms {
+                        o.push((key, weight, 1.0));
+                        for &(k, p) in w.forms.get(&key).map_or(&[][..], |f| &f[..]) {
+                            o.push((k, weight * p, p));
+                        }
+                    } else {
+                        o.push((key, weight, weight));
+                    }
+                }
+                if forms {
+                    // The same piece by two ways: the more likely.
+                    o.sort_unstable_by(|x, y| x.0.cmp(&y.0).then(y.2.total_cmp(&x.2)));
+                    o.dedup_by_key(|x| x.0);
+                }
             }
             if w.left_out > 0.0 {
                 // "Not in the entry": key 0.
-                o.push((0, w.left_out));
+                o.push((0, w.left_out, if forms { 1.0 } else { w.left_out }));
             }
             if o.is_empty() {
                 return;
@@ -360,6 +396,20 @@ impl Tuples {
         }
         let options = &mut self.options[..units.len()];
         let mut count: usize = options.iter().map(Vec::len).product();
+        // Too many: first the other forms go, the least likely first, so that what is left is
+        // never less than without them; then the least likely pieces.
+        while count > MOST_CHOICES {
+            let weakest = options
+                .iter()
+                .enumerate()
+                .flat_map(|(u, o)| o.iter().enumerate().map(move |(x, c)| (u, x, c)))
+                .filter(|(_, _, c)| c.2 < 1.0 && forms && c.0 != 0)
+                .min_by(|a, b| a.2.1.total_cmp(&b.2.1))
+                .map(|(u, x, _)| (u, x));
+            let Some((u, x)) = weakest else { break };
+            count = count / options[u].len() * (options[u].len() - 1);
+            options[u].remove(x);
+        }
         while count > MOST_CHOICES {
             let o = options.iter_mut().max_by_key(|o| o.len()).unwrap();
             o.sort_unstable_by(|x, y| y.1.total_cmp(&x.1));
@@ -373,7 +423,7 @@ impl Tuples {
             let mut w = prior;
             for (o, &x) in options.iter().zip(&self.at) {
                 key = (key ^ o[x].0).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
-                w *= o[x].1;
+                w *= o[x].2;
             }
             visit(key, w);
             // The next choice, as an odometer.
@@ -674,6 +724,7 @@ impl Index {
             }
             out.push(Piece {
                 at: s as u32,
+                len: (end - s) as u32,
                 key: fnv(&text[s..end]),
                 ln_chosen: chosen + spaces,
                 ln_typed: typed.ln(),
@@ -722,6 +773,7 @@ impl Index {
             let (f, field_start, _) = self.field_at(i, start);
             out.push(Piece {
                 at: start as u32,
+                len: (end - start) as u32,
                 key: fnv(&self.text[a + start..a + end]),
                 ln_chosen: self.ln_chosen(i, f, field_start, start, word.depth),
                 ln_typed: word.channel.inside(end - start, fewest).ln(),
@@ -962,9 +1014,18 @@ impl Index {
         let mut found = Vec::new();
         let mut keys: Vec<(u64, f64)> = Vec::new();
         let mut sum = 0.0;
+        let mut pieces_letters: ByKey<Vec<u8>> = ByKey::default();
         for part in &parts {
             let mut from = 0;
             for (&i, &end) in part.entries.iter().zip(&part.ends) {
+                if !query.options.endings.is_empty() {
+                    let a = self.starts[i as usize] as usize;
+                    for p in &part.pieces[from..end as usize] {
+                        pieces_letters.entry(p.key).or_insert_with(|| {
+                            self.text[a + p.at as usize..a + (p.at + p.len) as usize].to_vec()
+                        });
+                    }
+                }
                 let first = keys.len();
                 keys.extend(
                     part.pieces[from..end as usize]
@@ -1008,6 +1069,22 @@ impl Index {
         }
         found.sort_unstable_by_key(|f| f.at);
         let elsewhere = not_here / any;
+        // The other forms of each piece among the pieces found, once for all the entries.
+        let mut forms: ByKey<Vec<(u64, f64)>> = ByKey::default();
+        for (&key, letters) in &pieces_letters {
+            let mut mine: Vec<(u64, f64)> = Vec::new();
+            query.options.endings.variants(letters, |other, p| {
+                let k = fnv(other);
+                if k != key && pieces_letters.contains_key(&k) {
+                    mine.push((k, p));
+                }
+            });
+            if !mine.is_empty() {
+                mine.sort_unstable_by(|x, y| x.0.cmp(&y.0).then(y.1.total_cmp(&x.1)));
+                mine.dedup_by_key(|x| x.0);
+                forms.insert(key, mine);
+            }
+        }
         Worth {
             ln_any: any.ln(),
             elsewhere,
@@ -1019,6 +1096,7 @@ impl Index {
             found,
             keys,
             exact: word.exact.load(Ordering::Relaxed),
+            forms,
         }
     }
 
@@ -1193,14 +1271,14 @@ impl Index {
         for mine in &seen {
             total += given(mine);
             for (r, (prior, us)) in readings.iter().enumerate() {
-                scratch.each(r, *prior, us, mine, &units, |key, w| {
+                scratch.each(r, *prior, us, mine, &units, false, |key, w| {
                     *shared.entry(key).or_insert(0.0) += w
                 });
             }
         }
         if untouched > 0.0 {
             for (r, (prior, us)) in readings.iter().enumerate() {
-                scratch.each(r, *prior * untouched, us, &nowhere, &units, |key, w| {
+                scratch.each(r, *prior * untouched, us, &nowhere, &units, false, |key, w| {
                     *shared.entry(key).or_insert(0.0) += w;
                 });
             }
@@ -1220,8 +1298,8 @@ impl Index {
             // k), that is Σ_T M[T] over the choices T that i has too, divided by Σ_k P(query | k).
             let mut has = 0.0;
             for (r, (_, us)) in readings.iter().enumerate() {
-                scratch.each(r, 1.0, us, mine, &units, |key, _| {
-                    has += shared.get(&key).copied().unwrap_or(0.0)
+                scratch.each(r, 1.0, us, mine, &units, true, |key, f| {
+                    has += f * shared.get(&key).copied().unwrap_or(0.0)
                 });
             }
             let probability = (has / total).min(1.0);

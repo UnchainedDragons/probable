@@ -48,6 +48,7 @@ search uses all processors.
 | `require_all_words` | `false` | every typed word must stand for something in the entry (the classic "and" search); without it a word found in no entry is left out |
 | `typo_rate` | 0.03 | ρ, the probability of mistyping a letter |
 | `missing_word` | 0.01 | η, the probability that a typed word is not in the wanted entry |
+| `endings` | `&Endings::ITALIAN` | the endings of the language of the list: the filter counts "tubi" as the word "tubo", with the probability that they are the same word (see "Other forms of a word"); `&Endings::NONE` for the same letters only |
 | `exact_numbers` | `false` | numbers typed must appear whole: "150" does not find "1500", "acm12" does not find "ACM-18"; for catalogues where numbers are sizes or codes (it gets in the way of typing a number digit by digit) |
 
 ## How it works
@@ -118,6 +119,40 @@ Two consequences, with no rule written for them:
 - **Next to another word, a short word narrows.** In "valvola sf", "sf" begins many words of the
   list, but next to "valvola" it stands for a word found with "valvola".
 
+### Other forms of a word
+
+In many languages a word changes its ending for number and gender: "tubo", "tubi"; "rosso",
+"rossa". For the model above "tubi" is "tubo" with a typo, and when "tubo" is in the list exactly,
+the entries that only have "tubi" fall below the filter. They have the word typed, though: what
+they lack is the same letters.
+
+So the filter asks whether the entry has *the word*, in any form. A piece of the entry that is
+another form of a piece the query stands for counts with the probability that the two are the
+same word, instead of zero:
+
+```
+logit P(same word) = α[ending a ↔ ending b] + β[letters in the stem]
+```
+
+For Italian (`Endings::ITALIAN`) these are 31 numbers: 23 pairs of endings (e↔i, o↔i, a↔e, a↔o,
+co↔chi, …) and 8 corrections for short stems, where two forms are more often different words
+("caso", "casa"). They are counted, by maximum likelihood, on the 163 882 pairs of nouns,
+adjectives and past participles of the Morph-it! lexicon (University of Bologna) that differ only
+in their ending; only the counts are kept. Out of sample they are worth as much as a table with a
+probability for every pair of endings and every stem length (0.121 against 0.120 bits per pair;
+without the stem lengths, 0.138). Some values: tubo/tubi 0.98, rosso/rossa 0.95, costo/costa
+0.84, spa/spi 0.56.
+
+Only the filter changes: the score and the order stay those of the model, so the entries with the
+form typed come first. And since a piece can only add to an entry's probability, the filter
+never leaves out an entry it would keep with `Endings::NONE`; the tests check it on random lists.
+Words of different meaning with the same stem (costo/costa) are kept, at the bottom, with the
+probability the endings give them.
+
+Another language needs the same 31 numbers counted on its own forms: from an inflected lexicon
+(UniMorph has inflection tables for more than 150 languages), or from real searches (a word typed
+with one ending, an entry chosen with another).
+
 ### 3. Finding the pieces: Myers and Hyyrö
 
 For each query word (up to 64 letters), Myers' automaton (1999), in Hyyrö's form with
@@ -151,7 +186,7 @@ Everything can be rerun with `cargo test --release` and
 
 ### Correctness tests
 
-38 tests, including:
+42 tests, including:
 
 - the automaton against the full distance table on 200 000 random cases (words up to 64
   letters), free and anchored, and the full table against the definition;
@@ -160,6 +195,7 @@ Everything can be rerun with `cargo test --release` and
   fields;
 - the interleaved scan against scanning one entry at a time, and the parallel scan against the
   serial one;
+- the endings never leave out an entry kept without them, on 3 000 random lists and queries;
 - 4 000 searches on random lists (several alphabets, emoji, very long words, empty texts): no
   panic, right order, probabilities between 0 and 1, the filter removes and never adds.
 
@@ -190,7 +226,10 @@ The model was built looking at the purchases. One choice also looked at the othe
 are allowed from four letters, not three, after typing simulated queries letter by letter on
 purchases, sales and catalogues (see "Typing"). Below is the mean over 3 seeds (2 for the
 dictionary), 1 000 queries per seed and level (300 for the dictionary); the worst and best seed
-are in brackets.
+are in brackets. These figures were measured with `Endings::NONE`. With the Italian endings, on
+the three lists of things, recall stays the same within 0.1 points and precision is about one
+point lower: the simulated queries use the exact words of the entries, so they hardly test other
+forms of a word (see "Other forms of a word").
 
 The other methods:
 
@@ -294,6 +333,9 @@ is built in 0.54 s for a million entries.
 
 ## Limits
 
+- The endings are Italian unless told otherwise; for another language pass `Endings::NONE` until
+  its numbers are counted. They also join different words with the same stem (costo/costa) with
+  the probability their endings give.
 - At most 3 errors per word, none up to 3 letters; words longer than 64 letters use the full
   table, which is slow.
 - A word typed as two words of the entry joined is split at a single cut, with both pieces exact
