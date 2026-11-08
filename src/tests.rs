@@ -80,9 +80,15 @@ fn deeper_means_fewer_points() {
 #[test]
 fn exact_before_one_error_and_word_start_before_inside() {
     let index = Index::new(["UNDERBUSHING", "BUSHING", "BASHING"]);
-    let i = indexes(&index, "bushing");
-    assert_eq!(i[0], 1);
-    let h = index.search("bushing", &Options::default());
+    // With the whole word exact in an entry, the others are left out…
+    assert_eq!(indexes(&index, "bushing"), [1]);
+    // …and without the filter they come after, well below.
+    let all = Options {
+        exclude_below: None,
+        ..Options::default()
+    };
+    let h = index.search("bushing", &all);
+    assert_eq!(h[0].index, 1);
     assert!(h[0].score > h[1].score + 0.5, "{h:?}");
 }
 
@@ -193,6 +199,7 @@ fn measure_the_scan() {
         .collect();
     let index = Index::new(&entries);
     println!("{} folded letters", index.text.len());
+    let depth = Depth::new(1.0, index.longest + 1);
     for (word, k) in [("fitting", 2u32), ("pipe", 1), ("pl", 0), ("valve", 2)] {
         let p = word.as_bytes();
         let pattern = Pattern::new(p);
@@ -206,16 +213,28 @@ fn measure_the_scan() {
             });
         }
         let raw = t0.elapsed() / times;
+        let w = word_for(&index, p, k as usize, &depth);
         let t0 = Instant::now();
         for _ in 0..times {
-            std::hint::black_box(index.occurrences(p, k as usize, &index.by_length));
+            std::hint::black_box(index.found(&w, &index.by_length));
         }
         let full = t0.elapsed() / times;
         println!(
-            "{word} k={k}: automaton alone {raw:?} ({:.2} ns/letter, {} places ≤ k), occurrences {full:?}",
+            "{word} k={k}: automaton alone {raw:?} ({:.2} ns/letter, {} places ≤ k), pieces {full:?}",
             raw.as_nanos() as f64 / index.text.len() as f64,
             n / times as usize
         );
+    }
+}
+
+fn word_for<'a>(index: &Index, letters: &'a [u8], errors: usize, depth: &'a Depth) -> Word<'a> {
+    Word {
+        letters,
+        pattern: (letters.len() <= 64).then(|| Pattern::new(letters)),
+        errors,
+        channel: Channel::new(letters.len(), 0.03, index.letter_choices),
+        depth,
+        exact: AtomicBool::new(false),
     }
 }
 
@@ -301,8 +320,17 @@ fn random_input_always_holds() {
     }
 }
 
-fn same(x: &Occurrences, y: &Occurrences) -> bool {
-    (x.whole, x.prefix, x.inner, x.spanning) == (y.whole, y.prefix, y.inner, y.spanning)
+/// The pieces of every entry, by entry.
+fn by_entry(parts: &[Found], entries: usize) -> Vec<Vec<Piece>> {
+    let mut out = vec![Vec::new(); entries];
+    for part in parts {
+        let mut from = 0;
+        for (&i, &end) in part.entries.iter().zip(&part.ends) {
+            out[i as usize] = part.pieces[from..end as usize].to_vec();
+            from = end as usize;
+        }
+    }
+    out
 }
 
 /// The same index, searched serially and in parallel, gives the same answers.
@@ -317,6 +345,7 @@ fn parallel_equals_serial() {
         .collect();
     let large = Index::new(&entries);
     assert!(large.text.len() > PARALLEL_MIN && large.threads(large.len()) > 1);
+    let depth = Depth::new(1.0, large.longest + 1);
     for _ in 0..30 {
         let l = 1 + random.n(10);
         let query = random.text(l);
@@ -326,14 +355,10 @@ fn parallel_equals_serial() {
         };
         let a = large.search(&query, &o);
         for word in &large.query_words(&query) {
-            let errors = tolerance(word.len(), o.max_errors);
-            let pattern = (word.len() <= 64).then(|| Pattern::new(word));
-            let mut serial = vec![Occurrences::EMPTY; large.len()];
-            for (i, o) in large.occurrences_in(&large.by_length, word, pattern.as_ref(), errors) {
-                serial[i as usize] = o;
-            }
-            let parallel = large.occurrences(word, errors, &large.by_length);
-            assert!(serial.iter().zip(&parallel).all(|(x, y)| same(x, y)));
+            let w = word_for(&large, word, tolerance(word.len(), o.max_errors), &depth);
+            let serial = by_entry(&[large.scan(&large.by_length, &w, true)], large.len());
+            let parallel = by_entry(&large.found(&w, &large.by_length), large.len());
+            assert!(serial == parallel);
         }
         assert_eq!(a, large.search(&query, &o));
     }
@@ -350,19 +375,141 @@ fn interleaved_equals_one_at_a_time() {
         })
         .collect();
     let index = Index::new(&entries);
+    let depth = Depth::new(1.0, index.longest + 1);
     for word in ["fitting", "pipe", "x", "o1", "multilayer", "ra"] {
         let p = index.query_words(word).remove(0);
         for errors in 0..=2 {
-            let pattern = Pattern::new(&p);
-            let mut interleaved = vec![Occurrences::EMPTY; index.len()];
-            for (i, o) in index.occurrences_in(&index.by_length, &p, Some(&pattern), errors) {
-                interleaved[i as usize] = o;
+            let w = word_for(&index, &p, errors, &depth);
+            assert_eq!(
+                index.scan(&index.by_length, &w, true),
+                index.scan(&index.by_length, &w, false),
+                "{word} {errors}"
+            );
+        }
+    }
+}
+
+/// Every piece within the errors allowed, by definition: from each word start, every way of
+/// reading on (the word whole or begun, and with the words after it); inside each word, every
+/// piece not at its start.
+fn pieces_by_definition(index: &Index, i: usize, word: &Word<'_>) -> Vec<Piece> {
+    let a = index.starts[i] as usize;
+    let letters = index.starts[i + 1] as usize - a;
+    let text = &index.text[a..a + letters];
+    let k = word.errors as u32;
+    let m = word.letters.len();
+    let mut out: Vec<Piece> = Vec::new();
+    let mut add = |p: Piece| out.push(p);
+    for s in (0..letters).filter(|&s| index.is_word_start(a + s)) {
+        let (f, field_start, field_end) = index.field_at(i, s);
+        let chosen = index.ln_chosen(i, f, field_start, s, word.depth);
+        let mut spaces = 0.0;
+        let mut begun = u32::MAX;
+        for e in s + 1..=field_end {
+            let ends = e == field_end || index.is_word_start(a + e);
+            let d = myers::distance(word.letters, &text[s..e]);
+            if !ends {
+                begun = begun.min(d);
+                continue;
             }
-            for (i, y) in interleaved.iter().enumerate() {
-                let mut c = index.scan_state(i, errors);
-                let text = &index.text[c.start..c.start + c.letters];
-                pattern.scan(text, errors as u32, |j, d| index.record(&mut c, &p, j, d));
-                assert!(same(&c.occurrences, y), "{word} {i}");
+            let length = e - s;
+            let mut typed = 0.0;
+            if d <= k {
+                typed += word.channel.whole(length, d);
+            }
+            if begun <= k {
+                typed += word.channel.beginning(length, begun);
+            }
+            if typed > 0.0 {
+                add(Piece {
+                    at: s as u32,
+                    key: fnv(&text[s..e]),
+                    ln_chosen: chosen + spaces,
+                    ln_typed: typed.ln(),
+                });
+            }
+            begun = u32::MAX;
+            if e < field_end && index.is_hard_start(a + e) {
+                spaces += SPACE.ln();
+            }
+            // Further on every piece is longer than m + k letters.
+            if e >= s + m + word.errors {
+                break;
+            }
+        }
+        let end = (s + 1..letters)
+            .find(|&p| index.is_word_start(a + p))
+            .unwrap_or(letters);
+        let inside = (s + 1..end)
+            .flat_map(|x| (x + 1..=end).map(move |y| (x, y)))
+            .map(|(x, y)| myers::distance(word.letters, &text[x..y]))
+            .min()
+            .unwrap_or(u32::MAX);
+        if inside <= k {
+            add(Piece {
+                at: s as u32,
+                key: fnv(&text[s..end]),
+                ln_chosen: chosen,
+                ln_typed: word.channel.inside(end - s, inside).ln(),
+            });
+        }
+    }
+    out.sort_by_key(|p| (p.at, p.key));
+    let mut merged: Vec<Piece> = Vec::new();
+    for p in out {
+        match merged.last_mut() {
+            Some(q) if q.at == p.at && q.key == p.key => q.ln_typed = model::ln_add(q.ln_typed, p.ln_typed),
+            _ => merged.push(p),
+        }
+    }
+    merged
+}
+
+/// The pieces found from the hits of the automaton are exactly the pieces by definition.
+#[test]
+fn every_piece_is_found() {
+    let mut random = Random(23);
+    for round in 0..300 {
+        let entries: Vec<Vec<String>> = (0..20)
+            .map(|_| {
+                (0..1 + random.n(3))
+                    .map(|_| {
+                        let l = random.n(20);
+                        random.text(l)
+                    })
+                    .collect()
+            })
+            .collect();
+        let index = Index::with_fields(&entries, &[2.0, 1.0, 0.5]);
+        let depth = Depth::new(1.0, index.longest + 1);
+        for _ in 0..5 {
+            let l = 1 + random.n(4);
+            let query = random.text(l);
+            for word in index.query_words(&query) {
+                let errors = if round % 2 == 0 {
+                    tolerance(word.len(), 3)
+                } else {
+                    random.n(4)
+                };
+                let w = word_for(&index, &word, errors, &depth);
+                let found = by_entry(&[index.scan(&index.by_length, &w, true)], index.len());
+                for (i, got) in found.iter().enumerate() {
+                    let expected = pieces_by_definition(&index, i, &w);
+                    assert_eq!(
+                        got.len(),
+                        expected.len(),
+                        "{query:?} entry {i}: {got:?} {expected:?}"
+                    );
+                    for (x, y) in got.iter().zip(&expected) {
+                        assert!(
+                            x.at == y.at
+                                && x.key == y.key
+                                && (x.ln_chosen - y.ln_chosen).abs() < 1e-9
+                                && (x.ln_typed - y.ln_typed).abs() < 1e-9,
+                            "{query:?} entry {i}: {x:?} {y:?}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -454,7 +601,6 @@ fn a_chance_match_does_not_count_as_the_word() {
     ]);
     let all_words = Options {
         require_all_words: true,
-        exclude_below: None,
         ..Options::default()
     };
     assert_eq!(indexes_with(&index, "liza mk5 stone", &all_words), [0]);
@@ -494,4 +640,55 @@ fn exact_numbers_identify_things() {
     assert_eq!(indexes_with(&index, "acne 18.000", &exact), [2]);
     // Without the option a number is a word like any other.
     assert!(indexes(&index, "pipe 150").contains(&4));
+}
+
+#[test]
+fn typos_only_when_needed() {
+    let index = Index::new([
+        "thermostat valve",
+        "termostato caldaia",
+        "terme di saturnia",
+        "tergicristallo",
+    ]);
+    // «term» begins «termostato» and «terme»: «thermostat» and «tergicristallo» (one error) go.
+    let mut found = indexes(&index, "term");
+    found.sort_unstable();
+    assert_eq!(found, [1, 2]);
+    // A typo that is nowhere: the near ones come back.
+    assert_eq!(indexes(&index, "termostsato")[0], 1);
+}
+
+#[test]
+fn the_words_of_a_query_come_from_the_same_entry() {
+    // «sf» begins many words, mostly in entries without «valvola»: next to «valvola» it stands
+    // for a word found with «valvola».
+    let mut entries = vec![
+        "valvola a sfera 1/2".to_string(),
+        "valvola a sfera 3/4".to_string(),
+    ];
+    for (i, w) in [
+        "sfiato", "sfogo", "sfuso", "sforzo", "sfondo", "sfilato", "sfuocato", "sfarzo",
+    ]
+    .iter()
+    .enumerate()
+    {
+        for k in 0..20 {
+            entries.push(format!("{w} {i} {k}"));
+        }
+    }
+    entries.push("valvola di ritegno".to_string());
+    let index = Index::new(&entries);
+    let all = Options {
+        require_all_words: true,
+        ..Options::default()
+    };
+    let mut found = indexes_with(&index, "valvola sf", &all);
+    found.sort_unstable();
+    assert_eq!(found, [0, 1]);
+    // Every letter more keeps the same two, until the word is finished.
+    for q in ["valvola sfe", "valvola sfer", "valvola sfera"] {
+        let mut f = indexes_with(&index, q, &all);
+        f.sort_unstable();
+        assert_eq!(f, [0, 1], "{q}");
+    }
 }

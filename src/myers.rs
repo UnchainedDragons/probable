@@ -53,6 +53,19 @@ impl Pattern {
     /// without setting the low bit.
     #[inline(always)]
     pub(crate) fn step(&self, state: &mut State, c: u8) {
+        self.advance::<false>(state, c);
+    }
+
+    /// Like [`Pattern::step`], but the piece must start where the state was created: the top row
+    /// is 0, 1, 2, … (every character skipped before the word costs one), so `state.distance`
+    /// becomes the distance between the word and the whole text read so far.
+    #[inline(always)]
+    pub(crate) fn step_anchored(&self, state: &mut State, c: u8) {
+        self.advance::<true>(state, c);
+    }
+
+    #[inline(always)]
+    fn advance<const ANCHORED: bool>(&self, state: &mut State, c: u8) {
         let top = self.top;
         let equal = self.equal[c as usize];
         let up = state.up;
@@ -62,7 +75,7 @@ impl Pattern {
         let plus = down | !(zero | up);
         let minus = up & zero;
         state.distance = state.distance + u32::from(plus & top != 0) - u32::from(minus & top != 0);
-        let plus = plus << 1;
+        let plus = (plus << 1) | u64::from(ANCHORED);
         let minus = minus << 1;
         state.up = minus | !(zero | plus);
         state.down = plus & zero;
@@ -118,6 +131,30 @@ pub(crate) fn scan_slow(word: &[u8], text: &[u8], tolerance: u32, mut visit: imp
         if now[m] <= tolerance && !visit(j, now[m]) {
             return;
         }
+        std::mem::swap(&mut two_before, &mut before);
+        std::mem::swap(&mut before, &mut now);
+    }
+}
+
+/// The distance between the word and `text[..=j]`, for every `j`, with the full table: the
+/// reference for [`Pattern::step_anchored`] and the way for words over 64 letters.
+pub(crate) fn anchored_slow(word: &[u8], text: &[u8], mut visit: impl FnMut(usize, u32)) {
+    let m = word.len();
+    let mut two_before: Vec<u32> = (0..=m as u32).collect();
+    let mut before = two_before.clone();
+    let mut now = vec![0u32; m + 1];
+    for j in 0..text.len() {
+        now[0] = j as u32 + 1;
+        for i in 1..=m {
+            let mut d = (before[i - 1] + u32::from(!equal(word[i - 1], text[j])))
+                .min(before[i] + 1)
+                .min(now[i - 1] + 1);
+            if i >= 2 && j >= 1 && equal(word[i - 1], text[j - 1]) && equal(word[i - 2], text[j]) {
+                d = d.min(two_before[i - 2] + 1);
+            }
+            now[i] = d;
+        }
+        visit(j, now[m]);
         std::mem::swap(&mut two_before, &mut before);
         std::mem::swap(&mut before, &mut now);
     }
@@ -254,6 +291,40 @@ mod tests {
                 all(&word, &text, true),
                 "{word:?} {text:?}"
             );
+        }
+    }
+
+    /// Anchored at the start of the text, bit vectors and full table give the distance between the
+    /// word and every beginning of the text.
+    #[test]
+    fn anchored_matches_definition() {
+        let mut random = Random(0xD1B5_4A32_D192_ED03);
+        for round in 0..200_000 {
+            let letters = 2 + random.n(6);
+            let length = if round % 100 == 0 {
+                50 + random.n(15)
+            } else {
+                1 + random.n(12)
+            };
+            let word = random.word(length, letters);
+            let length = random.n(30);
+            let text = random.word(length, letters);
+            let expected: Vec<u32> = (0..text.len()).map(|j| distance(&word, &text[..=j])).collect();
+            let pattern = Pattern::new(&word);
+            let mut state = pattern.start();
+            let fast: Vec<u32> = text
+                .iter()
+                .map(|&c| {
+                    pattern.step_anchored(&mut state, c);
+                    state.distance
+                })
+                .collect();
+            assert_eq!(fast, expected, "{word:?} {text:?}");
+            if round % 10 == 0 {
+                let mut slow = Vec::new();
+                anchored_slow(&word, &text, |_, d| slow.push(d));
+                assert_eq!(slow, expected, "{word:?} {text:?}");
+            }
         }
     }
 

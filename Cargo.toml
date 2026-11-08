@@ -1,6 +1,6 @@
 [package]
 name = "probable"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Approximate string search: typos within a Damerau-Levenshtein distance, split or reordered words, a score that drops with depth, and a probability-based filter"
 license = "MIT"

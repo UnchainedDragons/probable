@@ -1,70 +1,84 @@
-//! The model: how much a word found (or not found) says about whether an entry is relevant, and
-//! how likely each entry is to be relevant. The formulas and the reasons behind them are in the
-//! README, "How it works".
+//! The model: how a query word is typed, given what the person wants. The formulas and their
+//! reasons are in the README, "The model".
+//!
+//! Someone wants an entry `k`. For each word they type, they pick a word `t` of `k` (more often
+//! one near the start of its field, and in a heavier field) and type it, or (probability η) they
+//! type something that is not in `k`. A word of `k` is typed
+//!
+//! - whole, or only its beginning, because the search runs while they type (probability μ: the
+//!   length typed so far is any of 1..=L, the whole word included);
+//! - or a piece from inside it (probability ι), as with codes;
+//! - or together with the next word, the space left out (probability σ per space).
+//!
+//! Every letter is mistyped with probability ρ; a mistake is one of about `A` letters (the
+//! perplexity of the letters of the list), so a piece at distance `d` from the typed word costs
+//! `(1 − ρ)^(m − d) (ρ / A)^d`. Something not in `k` is a word of the list with probability λ, a
+//! new string otherwise (letters drawn with the frequencies of the list, length geometric with
+//! the mean length of the words of the list).
 
-use std::f64::consts::LN_10;
-
-/// The maximum number of errors searched for, per word.
+/// The most errors searched, per word.
 pub(crate) const MAX_ERRORS: usize = 3;
 
-/// No match found.
-pub(crate) const NONE: u16 = u16::MAX;
+/// μ: the probability that a word is being typed and is not finished yet.
+const PARTIAL: f64 = 0.3;
 
-/// Where a query word first occurs in an entry, for each maximum number of errors `d` and for
-/// each of the four ways a piece of text can resemble it. Positions beyond 65 534 stay at 65 534.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Occurrences {
-    /// A whole word of the text: which one (0 is the first).
-    pub whole: [u16; MAX_ERRORS + 1],
-    /// The beginning of a word of the text that goes on further: which word.
-    pub prefix: [u16; MAX_ERRORS + 1],
-    /// Inside a word, not at its beginning: the letter where it starts.
-    pub inner: [u16; MAX_ERRORS + 1],
-    /// Across two or more words of the text: the letter where it starts.
-    pub spanning: [u16; MAX_ERRORS + 1],
+/// ι: the probability that the word typed is a piece from inside a word of the entry.
+const INNER: f64 = 0.1;
+
+/// σ: the probability of typing two words of the entry without the space between them, or one
+/// word of the entry with a space inside.
+pub(crate) const SPACE: f64 = 0.05;
+
+/// λ: when the word typed is not in the wanted entry, the probability that it is a word of some
+/// other entry rather than a new string.
+pub(crate) const FOREIGN_LISTED: f64 = 0.5;
+
+/// The probability of typing a word of `m` letters from a piece of a word of the entry.
+pub(crate) struct Channel {
+    /// `(1 − ρ)^(m − d) (ρ / A)^d` for d = 0..=MAX_ERRORS.
+    typos: [f64; MAX_ERRORS + 1],
 }
 
-impl Occurrences {
-    pub(crate) const EMPTY: Occurrences = Occurrences {
-        whole: [NONE; MAX_ERRORS + 1],
-        prefix: [NONE; MAX_ERRORS + 1],
-        inner: [NONE; MAX_ERRORS + 1],
-        spanning: [NONE; MAX_ERRORS + 1],
-    };
+impl Channel {
+    pub(crate) fn new(m: usize, rho: f64, alphabet: f64) -> Channel {
+        let mut typos = [0.0; MAX_ERRORS + 1];
+        for (d, t) in typos.iter_mut().enumerate() {
+            let right = m.saturating_sub(d) as f64;
+            *t = (right * (-rho).ln_1p() + d as f64 * (rho / alphabet).ln()).exp();
+        }
+        Channel { typos }
+    }
 
-    pub(crate) fn found(&self) -> bool {
-        [self.whole, self.prefix, self.inner, self.spanning]
-            .iter()
-            .any(|a| a.iter().any(|&p| p != NONE))
+    /// The word typed whole: `length` letters, `d` errors.
+    pub(crate) fn whole(&self, length: usize, d: u32) -> f64 {
+        let length = length.max(1) as f64;
+        (1.0 - PARTIAL - INNER + PARTIAL / length) * self.typos[d as usize]
+    }
+
+    /// Only the beginning of a word of `length` letters, `d` errors.
+    pub(crate) fn beginning(&self, length: usize, d: u32) -> f64 {
+        PARTIAL / length.max(1) as f64 * self.typos[d as usize]
+    }
+
+    /// A piece from inside a word of `length` letters (where it starts and how long it is, both
+    /// uniform), `d` errors.
+    pub(crate) fn inside(&self, length: usize, d: u32) -> f64 {
+        let length = length.max(1) as f64;
+        INNER / (length * length) * self.typos[d as usize]
     }
 }
 
-/// The constants of the model.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Constants {
-    /// β: the key at position `i` is worth `(i + 1)^-β` relative to the one at the start.
-    pub depth: f64,
-    /// ρ: the probability of mistyping a letter.
-    pub typo_rate: f64,
-    /// η: the probability that the wanted entry lacks one of the typed words.
-    pub missing_word: f64,
+/// The probability of the folded `word` as a new string: length geometric with mean `mean`,
+/// letters drawn with `frequencies`.
+pub(crate) fn new_string(word: &[u8], frequencies: &[f64; 256], mean: f64) -> f64 {
+    let mean = mean.max(1.0);
+    let ln_length = -mean.ln() + (word.len().max(1) - 1) as f64 * (-1.0 / mean).ln_1p();
+    let ln_letters: f64 = word.iter().map(|&b| frequencies[b as usize].ln()).sum();
+    (ln_length + ln_letters).exp().max(f64::MIN_POSITIVE)
 }
 
-/// Where, in the wanted entry, the piece matching the typed word lies: at the start of a word of
-/// the text, inside a word (someone typing part of a code), or across two words (someone typing
-/// as one word what the text splits, "multilayer" for "MULTI LAYER").
-const AT_WORD_START: f64 = 0.8;
-const INNER: f64 = 0.1;
-const SPANNING: f64 = 0.1;
-
-/// μ: the probability that a word is typed only in part (search as you type).
-const PARTIAL: f64 = 0.3;
-
-/// Imaginary entries, with the letter frequencies only, added to the real ones when estimating
-/// how often a word occurs by chance: with few texts the estimate does not go to zero.
-const IMAGINARY_ENTRIES: f64 = 20.0;
-
-/// The logarithm of `(x + 1)^-β / Σ_{y=1}^{n} y^-β`, the weight of position `x` out of `n`.
+/// The logarithm of `(x + 1)^-β / Σ_{y=1}^{n} y^-β`: how likely word `x` of a field of `n` words
+/// is to be the one chosen.
 pub(crate) struct Depth {
     beta: f64,
     /// `-β ln(x + 1)` for x = 0, 1, …
@@ -108,7 +122,7 @@ impl Depth {
         (self.last_sum + tail).ln()
     }
 
-    fn ln_weight(&self, position: usize, out_of: usize) -> f64 {
+    pub(crate) fn ln_weight(&self, position: usize, out_of: usize) -> f64 {
         let weight = match self.ln_weights.get(position) {
             Some(&w) => w,
             None => -self.beta * ((position + 1) as f64).ln(),
@@ -117,287 +131,59 @@ impl Depth {
     }
 }
 
-/// The shape of an entry: its length, and where its fields start.
-pub(crate) struct Shape<'a> {
-    pub letters: usize,
-    pub words: usize,
-    /// For each field, where it starts in the entry: (letter, word).
-    pub fields: &'a [(u32, u32)],
-    /// For each field, the logarithm of its share of the weights.
-    pub ln_weights: &'a [f64],
+/// `ln(e^a + e^b)`.
+pub(crate) fn ln_add(a: f64, b: f64) -> f64 {
+    let (high, low) = if a >= b { (a, b) } else { (b, a) };
+    if low == f64::NEG_INFINITY {
+        return high;
+    }
+    high + (low - high).exp().ln_1p()
 }
 
-impl Shape<'_> {
-    /// The field holding position `at` (a letter if `letters`, else a word): its log weight, the
-    /// position inside it and its length.
-    fn locate(&self, at: usize, letters: bool) -> (f64, usize, usize) {
-        let pick = |f: &(u32, u32)| if letters { f.0 as usize } else { f.1 as usize };
-        let total = if letters { self.letters } else { self.words };
-        for (k, field) in self.fields.iter().enumerate() {
-            let start = pick(field);
-            let end = self.fields.get(k + 1).map_or(total, pick);
-            if start <= at && at < end {
-                return (self.ln_weights[k], at - start, end - start);
+/// The most typing mistakes about spaces in one reading of the query: readings with more are
+/// worth σ³ or less, and are left out.
+const MOST_SPACE_MISTAKES: usize = 2;
+
+/// The ways of reading a query of `n` words: each word on its own, two adjacent words as one with
+/// a space typed by mistake, or one word as two words of the entry typed without the space
+/// between them (probability σ per space added or left out, 1 − σ per space right). Units: word
+/// `j` is unit `j`, words `j` and `j + 1` together unit `n + j`, the halves of word `j` units
+/// `halves[j]` and `halves[j] + 1` (`usize::MAX`: not split). Each reading: (ln prior, units).
+pub(crate) fn readings(n: usize, halves: &[usize]) -> Vec<(f64, Vec<usize>)> {
+    fn more(
+        j: usize,
+        mistakes: usize,
+        ln_prior: f64,
+        units: &mut Vec<usize>,
+        n: usize,
+        halves: &[usize],
+        out: &mut Vec<(f64, Vec<usize>)>,
+    ) {
+        if j == n {
+            out.push((ln_prior, units.clone()));
+            return;
+        }
+        let gap = if j > 0 { (-SPACE).ln_1p() } else { 0.0 };
+        let mistake = gap + SPACE.ln();
+        units.push(j);
+        more(j + 1, mistakes, ln_prior + gap, units, n, halves, out);
+        units.pop();
+        if mistakes < MOST_SPACE_MISTAKES {
+            if halves[j] != usize::MAX {
+                units.extend([halves[j], halves[j] + 1]);
+                more(j + 1, mistakes + 1, ln_prior + mistake, units, n, halves, out);
+                units.truncate(units.len() - 2);
+            }
+            if j + 1 < n {
+                units.push(n + j);
+                more(j + 2, mistakes + 1, ln_prior + mistake, units, n, halves, out);
+                units.pop();
             }
         }
-        (self.ln_weights[0], at, total)
     }
-}
-
-/// The statistics of the index needed by [`WordWeight::new`].
-#[derive(Clone, Copy)]
-pub(crate) struct Stats<'a> {
-    pub entries: usize,
-    pub mean_letters: f64,
-    pub mean_words: f64,
-    pub frequencies: &'a [f64; 256],
-}
-
-/// `P(Bin(m, ρ) = d)` for d = 0..=MAX_ERRORS, and `P(Bin(m, ρ) ≤ d)`.
-fn typos(m: usize, rho: f64) -> ([f64; MAX_ERRORS + 1], [f64; MAX_ERRORS + 1]) {
-    let mut exactly = [0.0; MAX_ERRORS + 1];
-    let mut at_most = [0.0; MAX_ERRORS + 1];
-    let mut term = (1.0 - rho).powi(m as i32);
-    let mut sum = 0.0;
-    for j in 0..=MAX_ERRORS {
-        if j <= m {
-            exactly[j] = term;
-            sum += term;
-            term *= (m - j) as f64 / (j + 1) as f64 * rho / (1.0 - rho);
-        }
-        at_most[j] = sum.min(1.0);
-    }
-    (exactly, at_most)
-}
-
-/// The probability, from the letter frequencies alone, that a random position starts a piece
-/// within d errors of the word: exact for d = 0, for d > 0 an overestimate (any d letters of
-/// the word replaced, in one of three ways).
-fn by_chance(word: &[u8], frequencies: &[f64; 256]) -> [f64; MAX_ERRORS + 1] {
-    let m = word.len();
-    let ln_exact: f64 = word.iter().map(|&b| frequencies[b as usize].ln()).sum();
-    let ln_mean = ln_exact / m as f64;
-    let mut out = [0.0; MAX_ERRORS + 1];
-    let mut sum = 0.0;
-    let mut combinations = 1.0;
-    for (j, f) in out.iter_mut().enumerate() {
-        if j <= m {
-            sum += combinations * (3.0f64.ln() * j as f64 - ln_mean * j as f64).exp();
-            combinations *= (m - j) as f64 / (j + 1) as f64;
-        }
-        *f = (ln_exact.exp() * sum).min(1.0);
-    }
+    let mut out = Vec::new();
+    more(0, 0, 0.0, &mut Vec::new(), n, halves, &mut out);
     out
-}
-
-/// From the fraction of entries containing the word to a rate per position: with independent
-/// positions, `P(at least one in n) = 1 − (1 − r)^n`.
-fn rate(fraction: f64, positions: f64) -> f64 {
-    let r = -(-fraction).ln_1p() / positions.max(1.0);
-    r.min(0.99)
-}
-
-/// The logarithm of the probability that the first chance piece falls at place `i`, with
-/// probability `r` at each place: `r (1 − r)^i`.
-fn ln_first(r: f64, i: usize) -> f64 {
-    r.ln() + i as f64 * (-r).ln_1p()
-}
-
-/// Whether a query word is in an entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Presence {
-    Missing,
-    /// Within tolerance, but only as likely as chance.
-    Found,
-    /// More likely the typed word than chance.
-    Genuine,
-}
-
-/// How much a query word weighs, estimated on the whole index.
-pub(crate) struct WordWeight {
-    errors: usize,
-    /// `ln P(typos = d)`: a piece at distance d is the wanted word typed with d typos.
-    ln_typos: [f64; MAX_ERRORS + 1],
-    /// For each `d`: the probability that a position of the text starts, by chance, a piece
-    /// within d errors. It is measured inside words, where a piece resembling the query word is
-    /// almost never the word itself: so chance has the real structure of the language ("on"
-    /// inside "condition") without the genuine occurrences of the word.
-    r: [f64; MAX_ERRORS + 1],
-    /// The share of positions where a word ends: a chance piece that starts a word also ends it
-    /// with this probability.
-    end: f64,
-    /// `log10 Λ` when the word is missing.
-    log_missing: f64,
-    missing_word: f64,
-}
-
-impl WordWeight {
-    pub(crate) fn new(
-        word: &[u8],
-        errors: usize,
-        inner_counts: &[usize; MAX_ERRORS + 1],
-        stats: &Stats<'_>,
-        constants: &Constants,
-    ) -> WordWeight {
-        let (exactly, at_most) = typos(word.len(), constants.typo_rate);
-        let chance = by_chance(word, stats.frequencies);
-        let entries = stats.entries as f64 + IMAGINARY_ENTRIES;
-        let highest = 1.0 - 0.5 / entries;
-        let positions = (stats.mean_letters - stats.mean_words).max(1.0);
-        let mut r = [1.0; MAX_ERRORS + 1];
-        for d in 0..=errors {
-            let expected = -(-chance[d] * positions).exp_m1();
-            let fraction =
-                ((inner_counts[d] as f64 + IMAGINARY_ENTRIES * expected) / entries).clamp(1e-300, highest);
-            r[d] = rate(fraction, positions);
-        }
-        WordWeight {
-            errors,
-            ln_typos: exactly.map(f64::ln),
-            r,
-            end: (stats.mean_words / stats.mean_letters.max(1.0)).clamp(0.01, 1.0),
-            log_missing: (constants.missing_word + (1.0 - constants.missing_word) * (1.0 - at_most[errors]))
-                .log10(),
-            missing_word: constants.missing_word,
-        }
-    }
-
-    /// `log10(η + (1 − η) e^x)`.
-    fn log_lr(&self, x: f64) -> f64 {
-        if x > 40.0 {
-            ((-self.missing_word).ln_1p() + x) / LN_10
-        } else {
-            (self.missing_word + (1.0 - self.missing_word) * x.exp()).log10()
-        }
-    }
-
-    /// `log10 Λ` of the word in the entry, and whether it is there. For each piece found,
-    /// `Λ = η + (1 − η) G / C`: G is the probability of finding it there if the entry is the
-    /// wanted one (typos, kind, depth), C that of finding it there by chance. The best piece
-    /// counts. The word is [`Presence::Found`] within tolerance, and [`Presence::Genuine`] when
-    /// some piece is exact, or more likely the typed word than chance (G ≥ C): "liza" with a
-    /// typo inside "canalizzabile" is found, but not genuine.
-    pub(crate) fn score(&self, o: &Occurrences, shape: &Shape<'_>, depth: &Depth) -> (f64, Presence) {
-        if !o.found() {
-            return (self.log_missing, Presence::Missing);
-        }
-        let mut best = self.log_missing;
-        let mut there = false;
-        // The weight of the field and the depth inside it.
-        let place = |at: usize, letters: bool| {
-            let (ln_field, inside, length) = shape.locate(at, letters);
-            ln_field + depth.ln_weight(inside, length)
-        };
-        // A place equal to the one for d − 1 is the same piece, already counted with fewer errors.
-        let new = |a: &[u16; MAX_ERRORS + 1], d: usize| a[d] != NONE && (d == 0 || a[d] != a[d - 1]);
-        for d in 0..=self.errors {
-            let r = self.r[d];
-            let typos = self.ln_typos[d];
-            if new(&o.whole, d) {
-                let i = o.whole[d] as usize;
-                let g = typos + (AT_WORD_START * (1.0 - PARTIAL)).ln() + place(i, false);
-                let x = g - ln_first(r * self.end, i);
-                there |= d == 0 || x >= 0.0;
-                best = best.max(self.log_lr(x));
-            }
-            if new(&o.prefix, d) {
-                let i = o.prefix[d] as usize;
-                let g = typos + (AT_WORD_START * PARTIAL).ln() + place(i, false);
-                let x = g - ln_first(r * (1.0 - self.end), i);
-                there |= d == 0 || x >= 0.0;
-                best = best.max(self.log_lr(x));
-            }
-            if new(&o.inner, d) {
-                let s = o.inner[d] as usize;
-                let g = typos + INNER.ln() + place(s, true);
-                let x = g - ln_first(r, s);
-                there |= d == 0 || x >= 0.0;
-                best = best.max(self.log_lr(x));
-            }
-            if new(&o.spanning, d) {
-                let s = o.spanning[d] as usize;
-                let g = typos + SPANNING.ln() + place(s, true);
-                let x = g - ln_first(r, s);
-                there |= d == 0 || x >= 0.0;
-                best = best.max(self.log_lr(x));
-            }
-        }
-        (best, if there { Presence::Genuine } else { Presence::Found })
-    }
-}
-
-/// π, the share of relevant entries: the larger of the maximum-likelihood estimate
-/// ([`prior_ml`]) and the share of entries with Λ ≥ 1, those whose evidence leans towards
-/// relevance. When the model underestimates the Λ of relevant entries (two-letter, ambiguous
-/// queries) the first collapses towards 1/N and good entries would be excluded; the second still
-/// counts them. A larger π can only remove exclusions.
-pub(crate) fn prior(log_lr: &[f64]) -> f64 {
-    if log_lr.is_empty() {
-        return 1.0;
-    }
-    let favourable = log_lr.iter().filter(|&&l| l >= 0.0).count() as f64 / log_lr.len() as f64;
-    prior_ml(log_lr).max(favourable)
-}
-
-/// π by maximum likelihood: the π in `[1/N, 1]` that maximises `Σ ln(π Λ_i + 1 − π)`. The
-/// function is concave, so bisection on the derivative is enough.
-pub(crate) fn prior_ml(log_lr: &[f64]) -> f64 {
-    let n = log_lr.len();
-    if n == 0 {
-        return 1.0;
-    }
-    let lowest = 1.0 / n as f64;
-    // Entries with huge or tiny Λ weigh 1/π and −1/(1 − π), up to 1e-8; the others are counted
-    // in bins 0.001 wide in log10 Λ (Λ is off by at most 0.23%, π by less).
-    let (mut high, mut low) = (0.0f64, 0.0f64);
-    let mut bins = vec![0u32; 16_001];
-    for &l in log_lr {
-        if l > 8.0 {
-            high += 1.0;
-        } else if l < -8.0 {
-            low += 1.0;
-        } else {
-            bins[((l + 8.0) * 1000.0).round() as usize] += 1;
-        }
-    }
-    let groups: Vec<(f64, f64)> = bins
-        .iter()
-        .enumerate()
-        .filter(|&(_, &n)| n > 0)
-        .map(|(c, &n)| (10f64.powf(c as f64 / 1000.0 - 8.0) - 1.0, f64::from(n)))
-        .collect();
-    let derivative = |pi: f64| {
-        let mut g = high / pi - if low > 0.0 { low / (1.0 - pi) } else { 0.0 };
-        for &(x, n) in &groups {
-            g += n * x / (1.0 + pi * x);
-        }
-        g
-    };
-    if low == 0.0 && derivative(1.0) >= 0.0 {
-        return 1.0;
-    }
-    if derivative(lowest) <= 0.0 {
-        return lowest;
-    }
-    let (mut below, mut above) = (lowest.ln(), 0.0f64);
-    for _ in 0..60 {
-        let middle = 0.5 * (below + above);
-        if derivative(middle.exp()) > 0.0 {
-            below = middle;
-        } else {
-            above = middle;
-        }
-    }
-    (0.5 * (below + above)).exp()
-}
-
-/// `P(relevant | Λ)` with share `π`.
-pub(crate) fn posterior(log_lr: f64, pi: f64) -> f64 {
-    if pi >= 1.0 {
-        return 1.0;
-    }
-    let ln_odds = (pi / (1.0 - pi)).ln() + log_lr * LN_10;
-    1.0 / (1.0 + (-ln_odds).exp())
 }
 
 #[cfg(test)]
@@ -405,43 +191,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn typos_are_binomial() {
-        let (exactly, at_most) = typos(8, 0.03);
-        assert!((exactly[0] - 0.97f64.powi(8)).abs() < 1e-12);
-        assert!((exactly[1] - 8.0 * 0.03 * 0.97f64.powi(7)).abs() < 1e-12);
-        assert!((at_most[1] - exactly[0] - exactly[1]).abs() < 1e-12);
-        assert_eq!(typos(1, 0.03).1[3], 1.0);
-        assert_eq!(typos(1, 0.03).0[2], 0.0);
+    fn every_reading_once() {
+        // Three words, the last one split: a|b|c, a|b|c', ab|c, ab|c', a|bc, and with two
+        // mistakes at most not a|bc… (there is no third mistake to make).
+        let r = readings(3, &[usize::MAX, usize::MAX, 5]);
+        let mut units: Vec<Vec<usize>> = r.iter().map(|x| x.1.clone()).collect();
+        units.sort();
+        assert_eq!(
+            units,
+            [
+                vec![0, 1, 2],
+                vec![0, 1, 5, 6],
+                vec![0, 4],
+                vec![3, 2],
+                vec![3, 5, 6]
+            ]
+        );
+        let q = (-SPACE).ln_1p();
+        let prior = |u: &[usize]| r.iter().find(|x| x.1 == u).unwrap().0;
+        assert!((prior(&[0, 1, 2]) - 2.0 * q).abs() < 1e-12);
+        assert!((prior(&[3, 5, 6]) - (2.0 * SPACE.ln() + q)).abs() < 1e-12);
     }
 
     #[test]
-    fn depth_weights_sum_to_one() {
-        let p = Depth::new(1.0, 300);
-        let sum: f64 = (0..120).map(|x| p.ln_weight(x, 120).exp()).sum();
-        assert!((sum - 1.0).abs() < 1e-9);
-        // Beyond the table, the integral stays close to the sum.
-        let short = Depth::new(0.7, 100);
-        let long = Depth::new(0.7, 5000);
-        assert!((short.ln_sum(5000) - long.ln_sum(5000)).abs() < 1e-2);
-    }
-
-    #[test]
-    fn the_prior_is_the_true_one() {
-        // 1000 entries: 50 with Λ = 10^4, the others with Λ = 10^-3. True π ≈ 0.05.
-        let mut l = vec![4.0; 50];
-        l.extend(std::iter::repeat_n(-3.0, 950));
-        let pi = prior_ml(&l);
-        assert!((pi - 0.05).abs() < 0.002, "{pi}");
-        assert_eq!(prior(&l), pi.max(0.05));
-        // No entry more likely relevant than not: π at its minimum.
-        assert_eq!(prior(&[-1.0; 10]), 0.1);
-        // Modest but favourable Λ: π does not drop below their share.
-        let mut l = vec![0.5; 100];
-        l.extend(std::iter::repeat_n(-1.5, 900));
-        assert!(prior(&l) >= 0.1);
-        // All very likely: π = 1.
-        assert_eq!(prior(&[3.0; 10]), 1.0);
-        assert_eq!(posterior(-50.0, 1.0), 1.0);
-        assert!((posterior(0.0, 0.5) - 0.5).abs() < 1e-12);
+    fn a_word_typed_whole_beats_its_beginning() {
+        let c = Channel::new(5, 0.03, 20.0);
+        assert!(c.whole(5, 0) > c.beginning(8, 0));
+        assert!(c.beginning(8, 0) > c.inside(8, 0));
+        assert!(c.whole(5, 0) > 100.0 * c.whole(5, 1));
     }
 }
