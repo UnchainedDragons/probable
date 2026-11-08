@@ -1,0 +1,10 @@
+[package]
+name = "probable-bench"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+probable = { path = ".." }
+nucleo-matcher = "0.3"

@@ -1,0 +1,22 @@
+[package]
+name = "probable"
+version = "0.1.0"
+edition = "2024"
+description = "Approximate string search: typos within a Damerau-Levenshtein distance, split or reordered words, a score that drops with depth, and a probability-based filter"
+license = "MIT"
+repository = "https://github.com/UnchainedDragons/probable"
+readme = "README.md"
+keywords = ["search", "fuzzy", "levenshtein", "typo-tolerant", "ranking"]
+categories = ["text-processing", "algorithms"]
+publish = false
+
+[workspace]
+members = [".", "bench"]
+
+[workspace.lints.clippy]
+too_many_lines = "warn"
+cognitive_complexity = "warn"
+
+[lints]
+workspace = true
+
