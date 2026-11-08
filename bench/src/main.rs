@@ -122,7 +122,14 @@ fn generate(entries: &[Vec<String>], noise: &Noise, random: &mut Random) -> Opti
         return None;
     }
     let r = random.f();
-    let how_many = (if r < 0.3 { 1 } else if r < 0.75 { 2 } else { 3 }).min(candidates.len());
+    let how_many = (if r < 0.3 {
+        1
+    } else if r < 0.75 {
+        2
+    } else {
+        3
+    })
+    .min(candidates.len());
     let mut chosen: Vec<usize> = Vec::new();
     while chosen.len() < how_many {
         let i = random.n(candidates.len());
@@ -160,7 +167,11 @@ fn generate(entries: &[Vec<String>], noise: &Noise, random: &mut Random) -> Opti
         let c: Vec<char> = typed[i].chars().collect();
         let at = 2 + random.n(c.len() - 3);
         let (a, b) = c.split_at(at);
-        typed[i] = format!("{} {}", a.iter().collect::<String>(), b.iter().collect::<String>());
+        typed[i] = format!(
+            "{} {}",
+            a.iter().collect::<String>(),
+            b.iter().collect::<String>()
+        );
     }
     if typed.len() >= 2 && random.f() < noise.join {
         let i = random.n(typed.len() - 1);
@@ -171,7 +182,11 @@ fn generate(entries: &[Vec<String>], noise: &Noise, random: &mut Random) -> Opti
     if random.f() < 0.3 {
         text = text.to_uppercase();
     }
-    Some(Query { text, intended, target })
+    Some(Query {
+        text,
+        intended,
+        target,
+    })
 }
 
 /// The relevant entries: those with all the intended words.
@@ -227,7 +242,14 @@ struct Counts {
 }
 
 impl Counts {
-    fn add(&mut self, kept: &[usize], relevant: &[bool], how_many_relevant: usize, target: usize, time: Duration) {
+    fn add(
+        &mut self,
+        kept: &[usize],
+        relevant: &[bool],
+        how_many_relevant: usize,
+        target: usize,
+        time: Duration,
+    ) {
         let n = relevant.len();
         let rk = kept.iter().filter(|&&i| relevant[i]).count();
         self.queries += 1;
@@ -342,9 +364,17 @@ fn evaluate(path: &str, how_many: usize, seed: u64) {
             let t0 = Instant::now();
             let hits = index.search(&q.text, &unfiltered);
             let time = t0.elapsed();
-            let filtered: Vec<usize> = hits.iter().filter(|h| h.probability >= 0.01).map(|h| h.index).collect();
+            let filtered: Vec<usize> = hits
+                .iter()
+                .filter(|h| h.probability >= 0.01)
+                .map(|h| h.index)
+                .collect();
             if done == 1 {
-                let from_library: Vec<usize> = index.search(&q.text, &Options::default()).iter().map(|h| h.index).collect();
+                let from_library: Vec<usize> = index
+                    .search(&q.text, &Options::default())
+                    .iter()
+                    .map(|h| h.index)
+                    .collect();
                 assert_eq!(from_library, filtered);
             }
             let all: Vec<usize> = hits.iter().map(|h| h.index).collect();
@@ -353,7 +383,10 @@ fn evaluate(path: &str, how_many: usize, seed: u64) {
             let t0 = Instant::now();
             let strict_hits: Vec<usize> = index.search(&q.text, &strict).iter().map(|h| h.index).collect();
             counts[2].add(&strict_hits, &relevant, rel.len(), q.target, t0.elapsed());
-            for (k, method) in [&nucleo as &dyn Method, &terms, &contains].into_iter().enumerate() {
+            for (k, method) in [&nucleo as &dyn Method, &terms, &contains]
+                .into_iter()
+                .enumerate()
+            {
                 let t0 = Instant::now();
                 let r = method.search(&q.text);
                 counts[3 + k].add(&r, &relevant, rel.len(), q.target, t0.elapsed());
@@ -396,8 +429,15 @@ fn evaluate(path: &str, how_many: usize, seed: u64) {
         } else {
             format!("[{}, {})", STEPS[g], STEPS[g + 1])
         };
-        let expected = if g == 10 { "—".to_string() } else { format!("{:.1}", calibration.expected[g]) };
-        println!("| {name} | {} | {expected} | {} |", calibration.entries[g], calibration.actual[g]);
+        let expected = if g == 10 {
+            "—".to_string()
+        } else {
+            format!("{:.1}", calibration.expected[g])
+        };
+        println!(
+            "| {name} | {} | {expected} | {} |",
+            calibration.entries[g], calibration.actual[g]
+        );
     }
     println!();
 }
@@ -405,11 +445,18 @@ fn evaluate(path: &str, how_many: usize, seed: u64) {
 fn speed(path: &str, times: usize) {
     let base = read(path);
     let entries: Vec<String> = (0..times)
-        .flat_map(|k| base.iter().map(move |v| if k == 0 { v.clone() } else { format!("{v} {k}") }))
+        .flat_map(|k| {
+            base.iter()
+                .map(move |v| if k == 0 { v.clone() } else { format!("{v} {k}") })
+        })
         .collect();
     let letters: usize = entries.iter().map(String::len).sum();
     let name = std::path::Path::new(path).file_name().unwrap().to_string_lossy();
-    println!("## {name} ×{times}: {} entries, {:.1} MB", entries.len(), letters as f64 / 1e6);
+    println!(
+        "## {name} ×{times}: {} entries, {:.1} MB",
+        entries.len(),
+        letters as f64 / 1e6
+    );
     let t0 = Instant::now();
     let index = Index::new(&entries);
     println!("index: {:?}", t0.elapsed());
@@ -448,6 +495,8 @@ fn main() {
     match a.get(1).map(String::as_str) {
         Some("evaluate") => evaluate(&a[2], number(3, 1000), number(4, 1) as u64),
         Some("speed") => speed(&a[2], number(3, 1)),
-        _ => eprintln!("probable-bench evaluate <list> [queries] [seed] | probable-bench speed <list> [times]"),
+        _ => {
+            eprintln!("probable-bench evaluate <list> [queries] [seed] | probable-bench speed <list> [times]")
+        }
     }
 }

@@ -50,13 +50,22 @@ fn piece(c: char) -> Piece {
 
 /// Letter or digit, for word starts between the two.
 fn is_digit(b: u8, c: char) -> bool {
-    if b < 128 { b.is_ascii_digit() } else { c.is_numeric() }
+    if b < 128 {
+        b.is_ascii_digit()
+    } else {
+        c.is_numeric()
+    }
 }
 
 /// Folds `text` into `out`, one byte per letter or digit. For each byte written it calls
 /// `mark(word_start, index_of_the_original_character)`. `code` gives the code of non-Latin
 /// letters (see the module).
-pub(crate) fn fold(text: &str, out: &mut Vec<u8>, mut code: impl FnMut(char) -> u8, mut mark: impl FnMut(bool, usize)) {
+pub(crate) fn fold(
+    text: &str,
+    out: &mut Vec<u8>,
+    mut code: impl FnMut(char) -> u8,
+    mut mark: impl FnMut(bool, usize),
+) {
     let mut after_separator = true;
     let mut digit_before = false;
     let mut lowercase_before = false;
@@ -95,9 +104,14 @@ mod tests {
     fn folded(text: &str) -> (String, String) {
         let mut out = Vec::new();
         let mut starts = String::new();
-        fold(text, &mut out, |_| UNKNOWN, |start, _| {
-            starts.push(if start { '^' } else { '.' });
-        });
+        fold(
+            text,
+            &mut out,
+            |_| UNKNOWN,
+            |start, _| {
+                starts.push(if start { '^' } else { '.' });
+            },
+        );
         (String::from_utf8_lossy(&out).into_owned(), starts)
     }
 
@@ -140,6 +154,9 @@ mod tests {
     #[test]
     fn the_table_is_sorted() {
         assert!(TABLE.windows(2).all(|w| w[0].0 < w[1].0));
-        assert!(TABLE.iter().all(|(_, s)| s.bytes().all(|b| b.is_ascii_alphanumeric() && !b.is_ascii_uppercase())));
+        assert!(TABLE.iter().all(|(_, s)| {
+            s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() && !b.is_ascii_uppercase())
+        }));
     }
 }

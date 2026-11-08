@@ -33,7 +33,9 @@ impl Occurrences {
     };
 
     pub(crate) fn found(&self) -> bool {
-        [self.whole, self.prefix, self.inner, self.spanning].iter().any(|a| a.iter().any(|&p| p != NONE))
+        [self.whole, self.prefix, self.inner, self.spanning]
+            .iter()
+            .any(|a| a.iter().any(|&p| p != NONE))
     }
 }
 
@@ -201,6 +203,16 @@ fn ln_first(r: f64, i: usize) -> f64 {
     r.ln() + i as f64 * (-r).ln_1p()
 }
 
+/// Whether a query word is in an entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Presence {
+    Missing,
+    /// Within tolerance, but only as likely as chance.
+    Found,
+    /// More likely the typed word than chance.
+    Genuine,
+}
+
 /// How much a query word weighs, estimated on the whole index.
 pub(crate) struct WordWeight {
     errors: usize,
@@ -235,7 +247,8 @@ impl WordWeight {
         let mut r = [1.0; MAX_ERRORS + 1];
         for d in 0..=errors {
             let expected = -(-chance[d] * positions).exp_m1();
-            let fraction = ((inner_counts[d] as f64 + IMAGINARY_ENTRIES * expected) / entries).clamp(1e-300, highest);
+            let fraction =
+                ((inner_counts[d] as f64 + IMAGINARY_ENTRIES * expected) / entries).clamp(1e-300, highest);
             r[d] = rate(fraction, positions);
         }
         WordWeight {
@@ -243,7 +256,8 @@ impl WordWeight {
             ln_typos: exactly.map(f64::ln),
             r,
             end: (stats.mean_words / stats.mean_letters.max(1.0)).clamp(0.01, 1.0),
-            log_missing: (constants.missing_word + (1.0 - constants.missing_word) * (1.0 - at_most[errors])).log10(),
+            log_missing: (constants.missing_word + (1.0 - constants.missing_word) * (1.0 - at_most[errors]))
+                .log10(),
             missing_word: constants.missing_word,
         }
     }
@@ -257,15 +271,18 @@ impl WordWeight {
         }
     }
 
-    /// `log10 Λ` of the word in the entry, and whether the word is there (within tolerance). For
-    /// each piece found, `Λ = η + (1 − η) G / C`: G is the probability of finding it there if
-    /// the entry is the wanted one (typos, kind, depth), C that of finding it there by chance.
-    /// The best piece counts.
-    pub(crate) fn score(&self, o: &Occurrences, shape: &Shape<'_>, depth: &Depth) -> (f64, bool) {
+    /// `log10 Λ` of the word in the entry, and whether it is there. For each piece found,
+    /// `Λ = η + (1 − η) G / C`: G is the probability of finding it there if the entry is the
+    /// wanted one (typos, kind, depth), C that of finding it there by chance. The best piece
+    /// counts. The word is [`Presence::Found`] within tolerance, and [`Presence::Genuine`] when
+    /// some piece is exact, or more likely the typed word than chance (G ≥ C): "liza" with a
+    /// typo inside "canalizzabile" is found, but not genuine.
+    pub(crate) fn score(&self, o: &Occurrences, shape: &Shape<'_>, depth: &Depth) -> (f64, Presence) {
         if !o.found() {
-            return (self.log_missing, false);
+            return (self.log_missing, Presence::Missing);
         }
         let mut best = self.log_missing;
+        let mut there = false;
         // The weight of the field and the depth inside it.
         let place = |at: usize, letters: bool| {
             let (ln_field, inside, length) = shape.locate(at, letters);
@@ -279,25 +296,33 @@ impl WordWeight {
             if new(&o.whole, d) {
                 let i = o.whole[d] as usize;
                 let g = typos + (AT_WORD_START * (1.0 - PARTIAL)).ln() + place(i, false);
-                best = best.max(self.log_lr(g - ln_first(r * self.end, i)));
+                let x = g - ln_first(r * self.end, i);
+                there |= d == 0 || x >= 0.0;
+                best = best.max(self.log_lr(x));
             }
             if new(&o.prefix, d) {
                 let i = o.prefix[d] as usize;
                 let g = typos + (AT_WORD_START * PARTIAL).ln() + place(i, false);
-                best = best.max(self.log_lr(g - ln_first(r * (1.0 - self.end), i)));
+                let x = g - ln_first(r * (1.0 - self.end), i);
+                there |= d == 0 || x >= 0.0;
+                best = best.max(self.log_lr(x));
             }
             if new(&o.inner, d) {
                 let s = o.inner[d] as usize;
                 let g = typos + INNER.ln() + place(s, true);
-                best = best.max(self.log_lr(g - ln_first(r, s)));
+                let x = g - ln_first(r, s);
+                there |= d == 0 || x >= 0.0;
+                best = best.max(self.log_lr(x));
             }
             if new(&o.spanning, d) {
                 let s = o.spanning[d] as usize;
                 let g = typos + SPANNING.ln() + place(s, true);
-                best = best.max(self.log_lr(g - ln_first(r, s)));
+                let x = g - ln_first(r, s);
+                there |= d == 0 || x >= 0.0;
+                best = best.max(self.log_lr(x));
             }
         }
-        (best, true)
+        (best, if there { Presence::Genuine } else { Presence::Found })
     }
 }
 

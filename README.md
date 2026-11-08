@@ -46,9 +46,10 @@ search uses all processors.
 | `max_errors` | 2 | maximum errors per word; fewer for short words (0 up to 2 letters, 1 up to 5, 2 up to 9, then 3), like Lucene's "AUTO" |
 | `depth` | 1.0 | β: a key at word `i` is worth `(i+1)^β` times less than one at the start; 0 turns it off |
 | `exclude_below` | `Some(0.01)` | the filter's ε; `None` keeps every entry with at least one word |
-| `require_all_words` | `false` | keep only entries with every word (the classic "and" search) |
+| `require_all_words` | `false` | keep only entries with every word (the classic "and" search): each exact, or within tolerance and more likely typed than there by chance ("liza" with a typo inside "canalizzabile" does not count) |
 | `typo_rate` | 0.03 | ρ, the probability of mistyping a letter |
 | `missing_word` | 0.01 | η, the probability that the wanted entry lacks one of the typed words |
+| `exact_numbers` | `false` | numbers typed must appear whole: "150" does not find "1500", "acm12" does not find "ACM-18"; for catalogues where numbers are sizes or codes (it gets in the way of typing a number digit by digit) |
 
 ## How it works
 
@@ -129,7 +130,7 @@ Everything can be rerun with `cargo test --release` and
 
 ### Correctness tests
 
-33 tests, including:
+35 tests, including:
 
 - the automaton against the full distance table on 200 000 random cases (words up to 64
   letters), and the full table against the definition;
@@ -175,30 +176,30 @@ The other methods:
 
 | list | method | recall | 1st entry relevant | MRR of the source entry | entries kept |
 |---|---|---|---|---|---|
-| purchases | **probable, filter 1%** | **95.9%** (94.2–97.5) | **86.1%** | **0.477** | 559 |
+| purchases | **probable, filter 1%** | **95.6%** (93.3–97.5) | **86.5%** | **0.480** | 510 |
 | | nucleo | 86.9% (83.2–89.8) | 71.3% | 0.366 | 553 |
 | | terms | 82.7% | 67.9% | 0.346 | 91 |
 | | contains | 77.4% | 55.9% | 0.306 | 102 |
-| sales | **probable, filter 1%** | **97.3%** (95.8–98.2) | **88.0%** | **0.413** | 253 |
+| sales | **probable, filter 1%** | **97.2%** (95.5–98.4) | **88.1%** | **0.414** | 239 |
 | | nucleo | 90.8% (89.6–92.4) | 78.2% | 0.290 | 191 |
 | | terms | 85.0% | 70.4% | 0.262 | 64 |
 | | contains | 81.0% | 59.2% | 0.263 | 67 |
-| catalogues | **probable, filter 1%** | **96.9%** (96.1–97.8) | **82.3%** | **0.216** | 4 811 |
+| catalogues | **probable, filter 1%** | **96.8%** (96.1–97.7) | **82.7%** | **0.216** | 4 279 |
 | | nucleo | 87.8% (85.2–91.3) | 69.3% | 0.173 | 2 643 |
 | | terms | 83.4% | 64.1% | 0.159 | 647 |
 | | contains | 79.9% | 54.1% | 0.139 | 707 |
-| dictionary | **probable, filter 1%** | **96.5%** (95.7–97.3) | **81.8%** | **0.857** | 450 |
+| dictionary | **probable, filter 1%** | **96.5%** (95.7–97.3) | **83.8%** | **0.871** | 304 |
 | | nucleo | 80.5% (80.1–80.8) | 69.8% | 0.724 | 291 |
 | | terms | 81.6% | 70.3% | 0.736 | 18 |
 | | contains | 78.0% | 68.7% | 0.710 | 87 |
 
 Without typos the search equals nucleo or does better: recall 95.4–97.9% against 94.6–97.9%,
-first entry relevant 84.5–91.0% against 84.5–87.7%. With 8% typos the gap widens: recall
-94.5–95.4% against 57.9–80.8% for nucleo.
+first entry relevant 84.7–91.2% against 84.5–87.7%. With 8% typos the gap widens: recall
+93.3–94.7% against 57.9–80.8% for nucleo.
 
 Precision (how many kept entries are relevant) is low for every method that tolerates typos
-(6–25%): someone typing "pl" may want "plus" or "plastic", and no search can know. That is why
-the order matters: the first relevant entry is at the top 82–91% of the time.
+(6–30%): someone typing "pl" may want "plus" or "plastic", and no search can know. That is why
+the order matters: the first relevant entry is at the top 83–91% of the time.
 
 #### The filter
 
@@ -207,24 +208,24 @@ typo levels:
 
 | ε | purchases | sales | catalogues | dictionary |
 |---|---|---|---|---|
-| 10% | 0.114% | 0.506% | 0.149% | 0.000% |
-| **1%** | **0.077%** | **0.348%** | **0.099%** | **0.000%** |
-| 0.1% | 0.029% | 0.237% | 0.118% | 0.000% |
-| 0.01% | 0.001% | 0.133% | 0.187% | 0.000% |
+| 10% | 0.146% | 0.576% | 0.224% | 0.000% |
+| **1%** | **0.107%** | **0.408%** | **0.192%** | **0.000%** |
+| 0.1% | 0.056% | 0.261% | 0.231% | 0.000% |
+| 0.01% | 0.037% | 0.184% | 0.307% | 0.000% |
 
-Band by band below 1%, the worst share is 0.602% (sales, probability between 0.1% and 1%). With
-ε = 1%, every excluded entry was irrelevant **at least 99.4% of the time**, in every list and
+And band by band below 1%: the worst share is 0.796% (sales, probability between 0.1% and 1%).
+With ε = 1%, every excluded entry was irrelevant **at least 99.2% of the time**, in every list and
 every band, and the same holds for ε = 10%.
 
-The cost: with ε = 1% the filter removes half of the entries or more (catalogues: 4 811 entries
-instead of 8 408), and loses 0 to 1.3 points of recall.
+The cost: with ε = 1% the filter removes half of the entries or more (catalogues: 4 279 entries
+instead of 8 415), and loses 0 to 2.8 points of recall, mostly with 8% typos.
 
 **What is not guaranteed:**
 
 - **Probabilities below 0.1% are too small.** Where the library says 0.001%, in the catalogues
-  the actual share is 0.19%. With ε = 0.1% or 0.01% the promise does not hold (sales and
+  the actual share is 0.31%. With ε = 0.1% or 0.01% the promise does not hold (sales and
   catalogues): don't use them.
-- **At the top, probabilities are too large.** Among entries given above 99%, 15–41% are
+- **At the top, probabilities are too large.** Among entries given above 99%, 23–42% are
   relevant: the probability says "this entry has what you typed", not "this is the one you
   meant" (see "pl").
 - **The guarantee holds for queries like the simulated ones.** It was measured on these four
@@ -237,16 +238,15 @@ one processor; the search uses all of them above 256 KB of text, and is also mea
 
 | list | entries | text | probable | probable, 1 processor | nucleo |
 |---|---|---|---|---|---|
-| sales | 1 167 | 0.1 MB | 0.23 | 0.23 | 0.30 |
-| purchases | 5 147 | 0.4 MB | 0.67 | 0.94 | 0.77 |
-| catalogues | 19 498 | 1.6 MB | 1.74 | 4.14 | 4.50 |
-| dictionary | 235 976 | 2.3 MB | 1.78 | 3.41 | 2.09 |
-| catalogues ×10 | 194 980 | 16 MB | 14.8 | 43.8 | 45.1 |
-| catalogues ×50 | 974 900 | 81 MB | 80.3 | — | 223.6 |
+| sales | 1 167 | 0.1 MB | 0.28 | 0.28 | 0.32 |
+| purchases | 5 147 | 0.4 MB | 0.83 | 1.04 | 0.77 |
+| catalogues | 19 498 | 1.6 MB | 1.97 | 4.84 | 4.61 |
+| dictionary | 235 976 | 2.3 MB | 1.97 | 3.64 | 2.12 |
+| catalogues ×10 | 194 980 | 16 MB | 15.9 | 51.6 | 45.2 |
+| catalogues ×50 | 974 900 | 81 MB | 92.3 | — | 226.6 |
 
-On one processor the search is slower than nucleo on short entries (dictionary: 1.65 times) and
-on par on long ones, while searching with typos. The index is built in 0.3 s for a million
-entries.
+On one processor the search is slower than nucleo, by 5–75% (most on the short entries of the
+dictionary), while searching with typos. The index is built in 0.5 s for a million entries.
 
 ## Limits
 
@@ -254,6 +254,8 @@ entries.
 - Query words are scored independently: two equal words count twice.
 - No operators (`"phrase"`, `-word`, `^start`): they can be added on top.
 - Splitting joined words tries a single cut, with both pieces exact.
+- `exact_numbers` gets in the way of typing a number digit by digit ("1" does not find "123"):
+  use it where numbers are typed whole, like catalogue measures.
 - In an entry with fields, the first occurrence of a word counts: give the fields most important
   first.
 - Domain rules stay with the caller: for example, a catalogue where a number is a measure (so

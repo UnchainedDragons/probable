@@ -123,28 +123,42 @@ pub(crate) fn scan_slow(word: &[u8], text: &[u8], tolerance: u32, mut visit: imp
     }
 }
 
-/// The same distance between two whole words.
+/// The same distance between two whole words. Three rows of the table, on the stack when the
+/// second word is short.
 pub(crate) fn distance(a: &[u8], b: &[u8]) -> u32 {
-    let (m, n) = (a.len(), b.len());
-    let mut t = vec![vec![0u32; n + 1]; m + 1];
-    for (i, row) in t.iter_mut().enumerate() {
-        row[0] = i as u32;
-    }
-    for (j, x) in t[0].iter_mut().enumerate() {
+    const SHORT: usize = 96;
+    let n = b.len();
+    let mut on_stack = [[0u32; SHORT + 1]; 3];
+    let mut on_heap: Vec<Vec<u32>>;
+    let [two_before, before, now]: [&mut [u32]; 3] = if n <= SHORT {
+        let [x, y, z] = &mut on_stack;
+        [&mut x[..=n], &mut y[..=n], &mut z[..=n]]
+    } else {
+        on_heap = vec![vec![0u32; n + 1]; 3];
+        let [x, y, z] = &mut on_heap[..] else {
+            unreachable!()
+        };
+        [&mut x[..], &mut y[..], &mut z[..]]
+    };
+    let (mut two_before, mut before, mut now) = (two_before, before, now);
+    for (j, x) in before.iter_mut().enumerate() {
         *x = j as u32;
     }
-    for i in 1..=m {
+    for i in 1..=a.len() {
+        now[0] = i as u32;
         for j in 1..=n {
-            let mut d = (t[i - 1][j - 1] + u32::from(!equal(a[i - 1], b[j - 1])))
-                .min(t[i - 1][j] + 1)
-                .min(t[i][j - 1] + 1);
+            let mut d = (before[j - 1] + u32::from(!equal(a[i - 1], b[j - 1])))
+                .min(before[j] + 1)
+                .min(now[j - 1] + 1);
             if i >= 2 && j >= 2 && equal(a[i - 1], b[j - 2]) && equal(a[i - 2], b[j - 1]) {
-                d = d.min(t[i - 2][j - 2] + 1);
+                d = d.min(two_before[j - 2] + 1);
             }
-            t[i][j] = d;
+            now[j] = d;
         }
+        std::mem::swap(&mut two_before, &mut before);
+        std::mem::swap(&mut before, &mut now);
     }
-    t[m][n]
+    before[n]
 }
 
 #[cfg(test)]
@@ -155,7 +169,12 @@ mod tests {
     /// the pieces of text ending there (the empty one included).
     fn by_definition(word: &[u8], text: &[u8]) -> Vec<u32> {
         (0..text.len())
-            .map(|j| (0..=j + 1).map(|s| distance(word, &text[s..j + 1])).min().unwrap())
+            .map(|j| {
+                (0..=j + 1)
+                    .map(|s| distance(word, &text[s..j + 1]))
+                    .min()
+                    .unwrap()
+            })
             .collect()
     }
 
@@ -208,7 +227,11 @@ mod tests {
             let word = random.word(length, letters);
             let length = random.n(12);
             let text = random.word(length, letters);
-            assert_eq!(all(&word, &text, true), by_definition(&word, &text), "{word:?} {text:?}");
+            assert_eq!(
+                all(&word, &text, true),
+                by_definition(&word, &text),
+                "{word:?} {text:?}"
+            );
         }
     }
 
@@ -218,11 +241,19 @@ mod tests {
         let mut random = Random(0x9E37_79B9_7F4A_7C15);
         for round in 0..200_000 {
             let letters = 2 + random.n(6);
-            let length = if round % 100 == 0 { 50 + random.n(15) } else { 1 + random.n(12) };
+            let length = if round % 100 == 0 {
+                50 + random.n(15)
+            } else {
+                1 + random.n(12)
+            };
             let word = random.word(length, letters);
             let length = random.n(40);
             let text = random.word(length, letters);
-            assert_eq!(all(&word, &text, false), all(&word, &text, true), "{word:?} {text:?}");
+            assert_eq!(
+                all(&word, &text, false),
+                all(&word, &text, true),
+                "{word:?} {text:?}"
+            );
         }
     }
 

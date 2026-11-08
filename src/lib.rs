@@ -33,7 +33,7 @@ mod table;
 use std::collections::HashMap;
 
 use fold::UNKNOWN;
-use model::{Constants, Depth, MAX_ERRORS, NONE, Occurrences, Shape, Stats, WordWeight};
+use model::{Constants, Depth, MAX_ERRORS, NONE, Occurrences, Presence, Shape, Stats, WordWeight};
 use myers::Pattern;
 
 /// How to search.
@@ -49,13 +49,19 @@ pub struct Options {
     /// excluded. `None`: no filter, every entry with at least one word is kept. Tested with
     /// ε = 1%; see the README before choosing a much smaller one.
     pub exclude_below: Option<f64>,
-    /// Keep only the entries that have every word (within tolerance), like a classic "and"
-    /// search; without it, an entry missing one word may stay if the others are strong enough.
+    /// Keep only the entries that have every word, like a classic "and" search: each word exact,
+    /// or within tolerance and more likely typed than there by chance ("liza" with a typo inside
+    /// "canalizzabile" does not count). Without it, an entry missing one word may stay if the
+    /// others are strong enough.
     pub require_all_words: bool,
     /// ρ: the probability of mistyping a letter.
     pub typo_rate: f64,
     /// η: the probability that the wanted entry lacks one of the typed words.
     pub missing_word: f64,
+    /// Numbers in the query must appear whole in the entry: "150" does not find "1500", "acm12"
+    /// does not find "ACM-18". For lists where numbers identify things (codes, sizes,
+    /// measures); typos stay allowed in the letters.
+    pub exact_numbers: bool,
 }
 
 impl Default for Options {
@@ -67,6 +73,7 @@ impl Default for Options {
             require_all_words: false,
             typo_rate: 0.03,
             missing_word: 0.01,
+            exact_numbers: false,
         }
     }
 }
@@ -105,6 +112,10 @@ pub struct Index {
     by_length: Vec<u32>,
     /// For each entry, the letters it has: one bit per [`letter_bit`].
     letter_sets: Vec<u64>,
+    /// The numbers of each entry (runs of digits in the folded text, field by field), hashed and
+    /// sorted; `number_starts` says where each entry's start, one more at the end.
+    numbers: Vec<u64>,
+    number_starts: Vec<u32>,
     /// How many fields each entry has, and where each starts in its entry: (letter, word).
     field_count: usize,
     field_starts: Vec<(u32, u32)>,
@@ -121,6 +132,26 @@ fn letter_bit(b: u8) -> u64 {
         b'0'..=b'9' => 26 + b - b'0',
         _ => 36 + b % 28,
     }
+}
+
+/// The numbers in a text, hashed (FNV-1a): runs of digits, split by anything else except a dot or
+/// a comma between two digits ("12.000" is 12000, "150 1000" are 150 and 1000).
+fn numbers(text: &str) -> Vec<u64> {
+    const START: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut out = Vec::new();
+    let mut hash: Option<u64> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(x) = chars.next() {
+        if x.is_ascii_digit() {
+            hash = Some((hash.unwrap_or(START) ^ x as u64).wrapping_mul(0x0100_0000_01b3));
+        } else if (x == '.' || x == ',') && hash.is_some() && chars.peek().is_some_and(char::is_ascii_digit) {
+            // A thousands or decimal separator: the number goes on.
+        } else if let Some(h) = hash.take() {
+            out.push(h);
+        }
+    }
+    out.extend(hash);
+    out
 }
 
 /// The errors allowed for a word of `m` letters.
@@ -183,7 +214,10 @@ impl Index {
         S: AsRef<str>,
     {
         assert!(!weights.is_empty(), "at least one field");
-        assert!(weights.iter().all(|w| w.is_finite() && *w > 0.0), "weights must be positive");
+        assert!(
+            weights.iter().all(|w| w.is_finite() && *w > 0.0),
+            "weights must be positive"
+        );
         let total: f64 = weights.iter().sum();
         let mut index = Index {
             text: Vec::new(),
@@ -197,6 +231,8 @@ impl Index {
             longest: 0,
             by_length: Vec::new(),
             letter_sets: Vec::new(),
+            numbers: Vec::new(),
+            number_starts: vec![0],
             field_count: weights.len(),
             field_starts: Vec::new(),
             field_ln_weights: weights.iter().map(|w| (w / total).ln()).collect(),
@@ -211,6 +247,9 @@ impl Index {
                 assert!(fields < weights.len(), "an entry has more fields than weights");
                 fields += 1;
                 index.field_starts.push(((position - start) as u32, words));
+                if field.as_ref().bytes().any(|b| b.is_ascii_digit()) {
+                    index.numbers.extend(numbers(field.as_ref()));
+                }
                 let alphabet = &mut index.alphabet;
                 let bits = &mut index.word_starts;
                 fold::fold(
@@ -237,32 +276,56 @@ impl Index {
                     },
                 );
             }
+            let first = *index.number_starts.last().unwrap() as usize;
+            index.numbers[first..].sort_unstable();
+            let unique = {
+                let mine = &mut index.numbers[first..];
+                let mut n = 0;
+                for k in 0..mine.len() {
+                    if k == 0 || mine[k] != mine[n - 1] {
+                        mine[n] = mine[k];
+                        n += 1;
+                    }
+                }
+                n
+            };
+            index.numbers.truncate(first + unique);
+            index.number_starts.push(index.numbers.len() as u32);
             for _ in fields..weights.len() {
                 index.field_starts.push(((position - start) as u32, words));
             }
             index.longest = index.longest.max(position - start);
-            index.letter_sets.push(index.text[start..].iter().fold(0, |s, &b| s | letter_bit(b)));
-            index.starts.push(u32::try_from(index.text.len()).expect("at most 4 GB of text"));
+            index
+                .letter_sets
+                .push(index.text[start..].iter().fold(0, |s, &b| s | letter_bit(b)));
+            index
+                .starts
+                .push(u32::try_from(index.text.len()).expect("at most 4 GB of text"));
             index.word_counts.push(words);
         }
-        index.word_starts.resize(index.text.len() / 64 + 1, 0);
-        let mut order: Vec<u32> = (0..index.word_counts.len() as u32).collect();
-        order.sort_by_key(|&i| index.starts[i as usize + 1] - index.starts[i as usize]);
-        index.by_length = order;
-        let entries = index.word_counts.len().max(1) as f64;
-        index.mean_letters = index.text.len() as f64 / entries;
-        index.mean_words = index.word_counts.iter().map(|&p| f64::from(p)).sum::<f64>() / entries;
+        index.finish();
+        index
+    }
+
+    /// After the last entry: the order by length, the means and the letter frequencies.
+    fn finish(&mut self) {
+        self.word_starts.resize(self.text.len() / 64 + 1, 0);
+        let mut order: Vec<u32> = (0..self.word_counts.len() as u32).collect();
+        order.sort_by_key(|&i| self.starts[i as usize + 1] - self.starts[i as usize]);
+        self.by_length = order;
+        let entries = self.word_counts.len().max(1) as f64;
+        self.mean_letters = self.text.len() as f64 / entries;
+        self.mean_words = self.word_counts.iter().map(|&p| f64::from(p)).sum::<f64>() / entries;
         let mut counts = [0usize; 256];
-        for &b in &index.text {
+        for &b in &self.text {
             counts[b as usize] += 1;
         }
         // A letter never seen counts as one seen half a time.
-        let total = index.text.len() as f64 + 128.0;
-        for (f, &c) in index.frequencies.iter_mut().zip(&counts) {
+        let total = self.text.len() as f64 + 128.0;
+        for (f, &c) in self.frequencies.iter_mut().zip(&counts) {
             *f = (c as f64 + 0.5) / total;
         }
-        index.frequencies[UNKNOWN as usize] = 0.5 / total;
-        index
+        self.frequencies[UNKNOWN as usize] = 0.5 / total;
     }
 
     /// How many entries.
@@ -287,7 +350,11 @@ impl Index {
             let inside = (to - word * 64).min(64);
             let bits = self.word_starts[word] >> (p % 64);
             let how_many = inside - p % 64;
-            let mask = if how_many >= 64 { !0 } else { (1u64 << how_many) - 1 };
+            let mask = if how_many >= 64 {
+                !0
+            } else {
+                (1u64 << how_many) - 1
+            };
             count += (bits & mask).count_ones() as usize;
             p = word * 64 + inside;
         }
@@ -300,28 +367,39 @@ impl Index {
             .split_whitespace()
             .map(|word| {
                 let mut out = Vec::new();
-                fold::fold(word, &mut out, |c| self.alphabet.get(&c).copied().unwrap_or(UNKNOWN), |_, _| {});
+                fold::fold(
+                    word,
+                    &mut out,
+                    |c| self.alphabet.get(&c).copied().unwrap_or(UNKNOWN),
+                    |_, _| {},
+                );
                 out
             })
             .filter(|p| !p.is_empty())
             .collect()
     }
 
-    /// Records in `c` the piece that ends at `j` at distance `d` from the word of `m` letters;
-    /// `false` when the entry has nothing more to say.
+    /// Records in `c` the piece that ends at `j` at distance `d` from `word`; `false` when the
+    /// entry has nothing more to say.
     #[inline]
-    fn record(&self, c: &mut Scan, m: usize, j: usize, d: u32) -> bool {
+    fn record(&self, c: &mut Scan, word: &[u8], j: usize, d: u32) -> bool {
+        let m = word.len();
         let d = d as usize;
         if c.unfilled.iter().all(|&x| d >= x) {
             return true;
         }
         let a = c.start;
         let s = (j + 1).saturating_sub(m);
-        // With d errors the piece may start up to d letters earlier or later.
+        // With d errors the piece may start up to d letters earlier or later: it starts a word
+        // only if the word is still within d errors of the text from that word start.
         let near = (0..=d)
             .flat_map(|x| [s.checked_sub(x), Some(s + x)])
             .flatten()
-            .find(|&p| p < c.letters && self.is_word_start(a + p));
+            .find(|&p| {
+                p <= j
+                    && self.is_word_start(a + p)
+                    && (d == 0 || myers::distance(word, &self.text[a + p..=a + j]) as usize <= d)
+            });
         let begins = near.unwrap_or(s);
         let spanning = begins < j && self.count_word_starts(a + begins + 1, a + j + 1) > 0;
         let (kind, value) = if spanning {
@@ -365,7 +443,6 @@ impl Index {
         pattern: Option<&Pattern>,
         errors: usize,
     ) -> Vec<(u32, Occurrences)> {
-        let m = word.len();
         let k = errors as u32;
         let mut out = Vec::with_capacity(which.len());
         // Each letter of the word that the entry lacks costs at least one error: with more than
@@ -386,7 +463,13 @@ impl Index {
             .copied()
             .filter(|&i| {
                 let has = self.letter_sets[i as usize];
-                unknown + letters.iter().filter(|x| has & x.0 == 0).map(|x| x.1).sum::<u32>() <= k
+                unknown
+                    + letters
+                        .iter()
+                        .filter(|x| has & x.0 == 0)
+                        .map(|x| x.1)
+                        .sum::<u32>()
+                    <= k
             })
             .collect();
         let which = &kept[..];
@@ -394,7 +477,7 @@ impl Index {
             for &i in which {
                 let mut c = self.scan_state(i as usize, errors);
                 let text = &self.text[c.start..c.start + c.letters];
-                myers::scan_slow(word, text, k, |j, d| self.record(&mut c, m, j, d));
+                myers::scan_slow(word, text, k, |j, d| self.record(&mut c, word, j, d));
                 out.push((i, c.occurrences));
             }
             return out;
@@ -403,11 +486,13 @@ impl Index {
         // previous one, but the entries are independent and the processor advances them together.
         let (groups, rest) = which.as_chunks::<LANES>();
         for group in groups {
-            let mut scans: [Scan; LANES] = std::array::from_fn(|l| self.scan_state(group[l] as usize, errors));
+            let mut scans: [Scan; LANES] =
+                std::array::from_fn(|l| self.scan_state(group[l] as usize, errors));
             let mut states = [pattern.start(); LANES];
             let mut alive = [true; LANES];
             let shortest = scans.iter().map(|v| v.letters).min().unwrap_or(0);
-            let texts: [&[u8]; LANES] = std::array::from_fn(|l| &self.text[scans[l].start..scans[l].start + shortest]);
+            let texts: [&[u8]; LANES] =
+                std::array::from_fn(|l| &self.text[scans[l].start..scans[l].start + shortest]);
             for j in 0..shortest {
                 for l in 0..LANES {
                     // SAFETY: every text has `shortest` letters and j < shortest.
@@ -416,7 +501,7 @@ impl Index {
                 }
                 for l in 0..LANES {
                     if states[l].distance <= k && alive[l] {
-                        alive[l] = self.record(&mut scans[l], m, j, states[l].distance);
+                        alive[l] = self.record(&mut scans[l], word, j, states[l].distance);
                     }
                 }
             }
@@ -426,7 +511,7 @@ impl Index {
                 if alive[l] {
                     for j in shortest..c.letters {
                         pattern.step(&mut state, self.text[c.start + j]);
-                        if state.distance <= k && !self.record(c, m, j, state.distance) {
+                        if state.distance <= k && !self.record(c, word, j, state.distance) {
                             break;
                         }
                     }
@@ -437,7 +522,7 @@ impl Index {
         for &i in rest {
             let mut c = self.scan_state(i as usize, errors);
             let text = &self.text[c.start..c.start + c.letters];
-            pattern.scan(text, k, |j, d| self.record(&mut c, m, j, d));
+            pattern.scan(text, k, |j, d| self.record(&mut c, word, j, d));
             out.push((i, c.occurrences));
         }
         out
@@ -449,7 +534,9 @@ impl Index {
         if (entries as f64 * self.mean_letters) < PARALLEL_MIN as f64 {
             return 1;
         }
-        std::thread::available_parallelism().map_or(1, |n| n.get()).min(16)
+        std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(16)
     }
 
     /// Where the word occurs in the entries of `order` (sorted by length), indexed by entry.
@@ -536,7 +623,7 @@ impl Index {
 
     /// `log10 Λ` of the word in each entry of `pool` (in the same order), whether it is there,
     /// and whether a word somewhere starts with it with at most one error.
-    fn score_word(&self, word: &[u8], query: &Query<'_>) -> (Vec<f64>, Vec<bool>, bool) {
+    fn score_word(&self, word: &[u8], query: &Query<'_>) -> (Vec<f64>, Vec<Presence>, bool) {
         let errors = tolerance(word.len(), query.options.max_errors);
         let all = self.occurrences(word, errors, query.order);
         // Chance is measured on the entries that lack the exact whole word: those that have it
@@ -562,8 +649,8 @@ impl Index {
         };
         let weight = WordWeight::new(word, errors, &inner_counts, &stats, &query.constants);
         let mut scores = vec![0.0f64; query.pool.len()];
-        let mut found = vec![false; query.pool.len()];
-        let score = |from: usize, scores: &mut [f64], found: &mut [bool]| {
+        let mut found = vec![Presence::Missing; query.pool.len()];
+        let score = |from: usize, scores: &mut [f64], found: &mut [Presence]| {
             for (k, (s, f)) in scores.iter_mut().zip(found.iter_mut()).enumerate() {
                 let i = query.pool[from + k] as usize;
                 let shape = Shape {
@@ -581,7 +668,11 @@ impl Index {
         } else {
             let per_part = query.pool.len().div_ceil(threads);
             std::thread::scope(|s| {
-                for (n, (sc, f)) in scores.chunks_mut(per_part).zip(found.chunks_mut(per_part)).enumerate() {
+                for (n, (sc, f)) in scores
+                    .chunks_mut(per_part)
+                    .zip(found.chunks_mut(per_part))
+                    .enumerate()
+                {
                     let score = &score;
                     s.spawn(move || score(n * per_part, sc, f));
                 }
@@ -645,7 +736,9 @@ impl Index {
             depth: Depth::new(constants.depth, self.longest + 1),
         };
         let mut totals = vec![0.0f64; pool.len()];
+        // Per entry: words found within tolerance, and words genuinely there.
         let mut found_words = vec![0usize; pool.len()];
+        let mut genuine_words = vec![0usize; pool.len()];
         for word in &words {
             let (mut scores, mut found, good) = self.score_word(word, &q);
             // A word found well nowhere may be two words typed without the space between them:
@@ -658,23 +751,42 @@ impl Index {
                 let (s2, f2, _) = self.score_word(&word[a..], &q);
                 for k in 0..scores.len() {
                     scores[k] = scores[k].max(s1[k] + s2[k] + MISSING_SPACE);
-                    found[k] |= f1[k] && f2[k];
+                    found[k] = found[k].max(f1[k].min(f2[k]));
                 }
             }
             for k in 0..scores.len() {
                 totals[k] += scores[k];
-                found_words[k] += usize::from(found[k]);
+                found_words[k] += usize::from(found[k] != Presence::Missing);
+                genuine_words[k] += usize::from(found[k] == Presence::Genuine);
             }
         }
         for t in &mut totals {
             *t = t.clamp(-300.0, 300.0);
         }
         let pi = model::prior(&totals);
+        // The numbers typed, when they must appear whole.
+        let mut wanted: Vec<u64> = if options.exact_numbers {
+            numbers(query)
+        } else {
+            Vec::new()
+        };
+        wanted.sort_unstable();
+        wanted.dedup();
+        let has_numbers = |k: usize| {
+            let i = pool[k] as usize;
+            let mine = &self.numbers[self.number_starts[i] as usize..self.number_starts[i + 1] as usize];
+            wanted.iter().all(|n| mine.binary_search(n).is_ok())
+        };
+        // With every word required, each must be genuinely there, not just by chance.
         let mut out: Vec<(usize, Hit)> = totals
             .iter()
-            .zip(&found_words)
+            .zip(found_words.iter().zip(&genuine_words))
             .enumerate()
-            .filter(|&(_, (_, &c))| c > 0 && (!options.require_all_words || c == words.len()))
+            .filter(|&(k, (_, (&c, &g)))| {
+                c > 0
+                    && (!options.require_all_words || g == words.len())
+                    && (wanted.is_empty() || has_numbers(k))
+            })
             .map(|(k, (&score, _))| {
                 let hit = Hit {
                     index: pool[k] as usize,
@@ -722,7 +834,17 @@ pub fn words(text: &str) -> Vec<String> {
             }
             // Non-Latin letters come back as themselves.
             let mut others = others.into_iter();
-            Some(out.iter().map(|&b| if b == UNKNOWN { others.next().unwrap_or('?') } else { b as char }).collect())
+            Some(
+                out.iter()
+                    .map(|&b| {
+                        if b == UNKNOWN {
+                            others.next().unwrap_or('?')
+                        } else {
+                            b as char
+                        }
+                    })
+                    .collect(),
+            )
         })
         .collect()
 }
@@ -734,7 +856,9 @@ pub fn highlight(text: &str, query: &str, max_errors: u8) -> Vec<usize> {
     let mut alphabet: HashMap<char, u8> = HashMap::new();
     let mut code = |c: char| {
         let n = alphabet.len();
-        *alphabet.entry(c).or_insert(if n < 127 { 128 + n as u8 } else { UNKNOWN })
+        *alphabet
+            .entry(c)
+            .or_insert(if n < 127 { 128 + n as u8 } else { UNKNOWN })
     };
     let mut folded = Vec::new();
     let mut originals = Vec::new();

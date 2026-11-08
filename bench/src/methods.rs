@@ -44,7 +44,10 @@ impl Nucleo {
 
 impl Method for Nucleo {
     fn search(&self, query: &str) -> Vec<usize> {
-        let folded: String = query.chars().map(|c| if c.is_whitespace() { ' ' } else { fold_nucleo(c) }).collect();
+        let folded: String = query
+            .chars()
+            .map(|c| if c.is_whitespace() { ' ' } else { fold_nucleo(c) })
+            .collect();
         let pattern = Pattern::parse(&folded, CaseMatching::Ignore, Normalization::Never);
         let mut matcher = self.matcher.borrow_mut();
         let mut found: Vec<(Reverse<u32>, usize)> = self
@@ -71,7 +74,9 @@ pub fn levenshtein(a: &[u8], b: &[u8]) -> usize {
     for (i, &x) in a.iter().enumerate() {
         now[0] = i + 1;
         for (j, &y) in b.iter().enumerate() {
-            now[j + 1] = (before[j] + usize::from(x != y)).min(before[j + 1] + 1).min(now[j] + 1);
+            now[j + 1] = (before[j] + usize::from(x != y))
+                .min(before[j + 1] + 1)
+                .min(now[j] + 1);
         }
         std::mem::swap(&mut before, &mut now);
     }

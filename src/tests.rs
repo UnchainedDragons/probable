@@ -3,7 +3,11 @@
 use super::*;
 
 fn indexes(index: &Index, query: &str) -> Vec<usize> {
-    index.search(query, &Options::default()).into_iter().map(|h| h.index).collect()
+    index
+        .search(query, &Options::default())
+        .into_iter()
+        .map(|h| h.index)
+        .collect()
 }
 
 const ENTRIES: [&str; 8] = [
@@ -22,7 +26,11 @@ fn empty_query_gives_everything_in_order() {
     let index = Index::new(ENTRIES);
     assert_eq!(indexes(&index, ""), (0..8).collect::<Vec<_>>());
     assert_eq!(indexes(&index, " \t ,"), (0..8).collect::<Vec<_>>());
-    assert!(Index::new(Vec::<String>::new()).search("pipe", &Options::default()).is_empty());
+    assert!(
+        Index::new(Vec::<String>::new())
+            .search("pipe", &Options::default())
+            .is_empty()
+    );
 }
 
 #[test]
@@ -108,7 +116,11 @@ fn require_all_words_like_classic_search() {
         exclude_below: None,
         ..Options::default()
     };
-    let mut i: Vec<_> = index.search("fitting brass", &o).into_iter().map(|h| h.index).collect();
+    let mut i: Vec<_> = index
+        .search("fitting brass", &o)
+        .into_iter()
+        .map(|h| h.index)
+        .collect();
     i.sort_unstable();
     assert_eq!(i, [1, 5]);
 }
@@ -139,17 +151,28 @@ fn equal_scores_keep_the_order() {
 
 #[test]
 fn letters_to_highlight() {
-    assert_eq!(highlight("Café FITTING", "fiting", 2), (5..12).collect::<Vec<_>>());
+    assert_eq!(
+        highlight("Café FITTING", "fiting", 2),
+        (5..12).collect::<Vec<_>>()
+    );
     assert_eq!(highlight("Café FITTING", "cafe", 2), (0..4).collect::<Vec<_>>());
-    assert_eq!(highlight("Pipe Multi-Layer", "multilayer", 2), [5, 6, 7, 8, 9, 11, 12, 13, 14, 15]);
+    assert_eq!(
+        highlight("Pipe Multi-Layer", "multilayer", 2),
+        [5, 6, 7, 8, 9, 11, 12, 13, 14, 15]
+    );
     assert!(highlight("Pipe", "zzzz", 2).is_empty());
     // A word start before a piece inside a word.
-    assert_eq!(highlight("underbushing bushing", "bushing", 2), (13..20).collect::<Vec<_>>());
+    assert_eq!(
+        highlight("underbushing bushing", "bushing", 2),
+        (13..20).collect::<Vec<_>>()
+    );
 }
 
 #[test]
 fn a_large_index_is_searched_in_parallel_with_the_same_result() {
-    let entries: Vec<String> = (0..60_000).map(|i| format!("entry {i} fitting {} brass {}", i % 97, i % 13)).collect();
+    let entries: Vec<String> = (0..60_000)
+        .map(|i| format!("entry {i} fitting {} brass {}", i % 97, i % 13))
+        .collect();
     let index = Index::new(&entries);
     assert!(index.text.len() > PARALLEL_MIN);
     let h = index.search("entry 12345", &Options::default());
@@ -163,8 +186,11 @@ fn a_large_index_is_searched_in_parallel_with_the_same_result() {
 #[ignore]
 fn measure_the_scan() {
     use std::time::Instant;
-    let entries: Vec<String> =
-        std::fs::read_to_string(std::env::var("LIST").unwrap()).unwrap().lines().map(String::from).collect();
+    let entries: Vec<String> = std::fs::read_to_string(std::env::var("LIST").unwrap())
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
     let index = Index::new(&entries);
     println!("{} folded letters", index.text.len());
     for (word, k) in [("fitting", 2u32), ("pipe", 1), ("pl", 0), ("valve", 2)] {
@@ -198,13 +224,16 @@ struct Random(u64);
 
 impl Random {
     fn n(&mut self, n: usize) -> usize {
-        self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         ((self.0 >> 33) % n as u64) as usize
     }
     fn text(&mut self, length: usize) -> String {
         const PIECES: &[&str] = &[
-            "a", "b", "c", "o", "r", "t", "1", "8", "0", " ", " ", "-", ".", "/", "È", "à", "ß", "Æ", "Ω", "ж", "中",
-            "😀", "ＡＢ", "²", "\t", "'", "fitting", "PIPE", "multi", "layer", "x",
+            "a", "b", "c", "o", "r", "t", "1", "8", "0", " ", " ", "-", ".", "/", "È", "à", "ß", "Æ", "Ω",
+            "ж", "中", "😀", "ＡＢ", "²", "\t", "'", "fitting", "PIPE", "multi", "layer", "x",
         ];
         (0..length).map(|_| PIECES[self.n(PIECES.len())]).collect()
     }
@@ -234,7 +263,13 @@ fn random_input_always_holds() {
                 ..Options::default()
             };
             let all = index.search(&query, &unfiltered);
-            let filtered = index.search(&query, &Options { max_errors, ..Options::default() });
+            let filtered = index.search(
+                &query,
+                &Options {
+                    max_errors,
+                    ..Options::default()
+                },
+            );
             let strict = index.search(
                 &query,
                 &Options {
@@ -246,7 +281,10 @@ fn random_input_always_holds() {
             );
             for h in &all {
                 assert!(h.index < entries.len());
-                assert!((0.0..=1.0).contains(&h.probability) && h.score.is_finite(), "{h:?}");
+                assert!(
+                    (0.0..=1.0).contains(&h.probability) && h.score.is_finite(),
+                    "{h:?}"
+                );
             }
             assert!(all.windows(2).all(|w| w[0].score > w[1].score || (w[0].score == w[1].score && w[0].index < w[1].index)));
             let mut seen = std::collections::HashSet::new();
@@ -323,7 +361,7 @@ fn interleaved_equals_one_at_a_time() {
             for (i, y) in interleaved.iter().enumerate() {
                 let mut c = index.scan_state(i, errors);
                 let text = &index.text[c.start..c.start + c.letters];
-                pattern.scan(text, errors as u32, |j, d| index.record(&mut c, p.len(), j, d));
+                pattern.scan(text, errors as u32, |j, d| index.record(&mut c, &p, j, d));
                 assert!(same(&c.occurrences, y), "{word} {i}");
             }
         }
@@ -342,7 +380,10 @@ fn search_among_keeps_the_callers_order() {
     assert_eq!(positions(index.search_among("", &[2, 1, 2, 7], &o)), [2, 1]);
     assert!(index.search_among("red", &[], &o).is_empty());
     // Among everything, the same as `search`.
-    assert_eq!(index.search_among("pipe", &[0, 1, 2, 3, 4], &o), index.search("pipe", &o));
+    assert_eq!(
+        index.search_among("pipe", &[0, 1, 2, 3, 4], &o),
+        index.search("pipe", &o)
+    );
 }
 
 #[test]
@@ -351,14 +392,19 @@ fn the_index_can_be_shared_between_threads() {
     shareable::<Index>();
     let index = std::sync::Arc::new(Index::new(ENTRIES));
     let other = std::sync::Arc::clone(&index);
-    let from_thread = std::thread::spawn(move || other.search("brass", &Options::default())).join().unwrap();
+    let from_thread = std::thread::spawn(move || other.search("brass", &Options::default()))
+        .join()
+        .unwrap();
     assert_eq!(from_thread, index.search("brass", &Options::default()));
 }
 
 #[test]
 fn depth_starts_again_in_each_field() {
     // The same phone number, after a long name or with no name at all: equally good.
-    let index = Index::with_fields([vec!["Giulia Bianchi", "320 0000000"], vec!["", "320 0000000"]], &[12.0, 11.0]);
+    let index = Index::with_fields(
+        [vec!["Giulia Bianchi", "320 0000000"], vec!["", "320 0000000"]],
+        &[12.0, 11.0],
+    );
     let h = index.search("3200000000", &Options::default());
     assert_eq!(h.iter().map(|h| h.index).collect::<Vec<_>>(), [0, 1]);
     assert!((h[0].score - h[1].score).abs() < 1e-9, "{h:?}");
@@ -378,8 +424,18 @@ fn heavier_fields_count_more() {
 fn one_field_is_the_same_as_plain_text() {
     let plain = Index::new(ENTRIES);
     let fields = Index::with_fields(ENTRIES.iter().map(|e| [*e]), &[5.0]);
-    for q in ["fitting brass", "solar cable", "invertr", "multi layer", "20mm sleeve"] {
-        assert_eq!(plain.search(q, &Options::default()), fields.search(q, &Options::default()), "{q}");
+    for q in [
+        "fitting brass",
+        "solar cable",
+        "invertr",
+        "multi layer",
+        "20mm sleeve",
+    ] {
+        assert_eq!(
+            plain.search(q, &Options::default()),
+            fields.search(q, &Options::default()),
+            "{q}"
+        );
     }
 }
 
@@ -387,4 +443,55 @@ fn one_field_is_the_same_as_plain_text() {
 #[should_panic(expected = "more fields than weights")]
 fn too_many_fields_is_an_error() {
     Index::with_fields([["a", "b", "c"]], &[1.0, 1.0]);
+}
+
+#[test]
+fn a_chance_match_does_not_count_as_the_word() {
+    // «liza» with one typo occurs inside «canalizzabile», «mk5» is close to «Mk6»: by chance.
+    let index = Index::new([
+        "Wood stove Liza Mk5 Stone",
+        "Pellet stove Aria Stone Mk6, canalizzabile with front ventilation",
+    ]);
+    let all_words = Options {
+        require_all_words: true,
+        exclude_below: None,
+        ..Options::default()
+    };
+    assert_eq!(indexes_with(&index, "liza mk5 stone", &all_words), [0]);
+    // An exact piece always counts, even inside a word; the whole word comes first.
+    let short = Index::new(["valve a sphere", "valve sphere"]);
+    assert_eq!(indexes_with(&short, "valve a", &all_words), [0, 1]);
+}
+
+fn indexes_with(index: &Index, query: &str, options: &Options) -> Vec<usize> {
+    index
+        .search(query, options)
+        .into_iter()
+        .map(|h| h.index)
+        .collect()
+}
+
+#[test]
+fn exact_numbers_identify_things() {
+    let index = Index::new([
+        "ACM-09 Acme 9.000 BTU",
+        "ACM-12 Acme 12.000 BTU",
+        "ACM-18 Acme 18.000 BTU",
+        "Pipe 150",
+        "Pipe 1500",
+    ]);
+    let exact = Options {
+        exact_numbers: true,
+        ..Options::default()
+    };
+    assert_eq!(indexes_with(&index, "acm-12", &exact), [1]);
+    assert_eq!(indexes_with(&index, "ACME 12000", &exact), [1]);
+    assert_eq!(indexes_with(&index, "pipe 150", &exact), [3]);
+    let measures = Index::new(["TA 1 150 1000 utile", "TB 2 1500"]);
+    assert_eq!(indexes_with(&measures, "150", &exact), [0]);
+    assert_eq!(indexes_with(&measures, "1000", &exact), [0]);
+    // Typos stay allowed in the letters.
+    assert_eq!(indexes_with(&index, "acne 18.000", &exact), [2]);
+    // Without the option a number is a word like any other.
+    assert!(indexes(&index, "pipe 150").contains(&4));
 }
